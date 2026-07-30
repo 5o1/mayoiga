@@ -1,0 +1,62 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: |
+          make test
+
+      - name: Build Linux and Windows binaries
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/ubuntu-amd64 dist/windows-amd64
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -buildvcs=false \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o dist/ubuntu-amd64/mayoiga ./cmd/mayoiga
+
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -buildvcs=false \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o dist/windows-amd64/mayoiga.exe ./cmd/mayoiga
+
+          tar -C dist/ubuntu-amd64 -czf \
+            "dist/mayoiga_${VERSION}_ubuntu_amd64.tar.gz" mayoiga
+          (cd dist/windows-amd64 && zip -q \
+            "../mayoiga_${VERSION}_windows_amd64.zip" mayoiga.exe)
+
+          cd dist
+          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          dist/*.tar.gz
+          dist/*.zip
+          dist/SHA256SUMS
+          --verify-tag
+          --generate-notes
+          --title "mayoiga ${GITHUB_REF_NAME}"

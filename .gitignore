@@ -1,0 +1,22 @@
+# AI and local agent instructions
+AGENTS.md
+.agents/
+.codex/
+
+# Build and release output
+bin/
+dist/
+*.exe
+__pycache__/
+*.pyc
+
+# Local runtime state and secrets
+nodes/
+*.key
+*.pem
+*.p12
+*.pid
+*.log
+.env
+config/*.env
+!config/.env.example
