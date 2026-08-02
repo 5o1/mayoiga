@@ -7,10 +7,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -42,7 +44,7 @@ func newConnectionTestRegistry(t *testing.T) connectionTestRegistry {
 		ID: "target", Name: "target", Role: "client", Segment: "school",
 		VirtualNetwork: "mesh", LastSeen: time.Now().UTC(),
 		Services: []publishedService{{
-			NodeID: "target", Name: "svc", Segment: "school", Endpoint: "target.example:28443",
+			NodeID: "target", Name: "svc", Segment: "school",
 			UUID: "uuid", PinnedSHA256: stringsOfHex("a"),
 		}},
 	}
@@ -129,6 +131,43 @@ func TestConnectionLongPollWakesImmediatelyAndRequestIsIdempotent(t *testing.T) 
 	fixture.registry.mu.Unlock()
 	if count != 1 {
 		t.Fatalf("idempotent request count=%d", count)
+	}
+}
+
+func TestConnectionErrorsAreStructuredAndRejectionReasonIsVisible(t *testing.T) {
+	fixture := newConnectionTestRegistry(t)
+	missing := fixture.call(t, "source", "/v1/connections/request", createConnectionInput{
+		IdempotencyKey: "missing-service", TargetNode: "target", Service: "missing",
+	})
+	if missing.Code != http.StatusNotFound || !strings.HasPrefix(missing.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("missing service response=%d content-type=%q", missing.Code, missing.Header().Get("Content-Type"))
+	}
+	var remote apiErrorResponse
+	if err := json.Unmarshal(missing.Body.Bytes(), &remote); err != nil {
+		t.Fatal(err)
+	}
+	if remote.Code != "published_service_missing" || remote.Message != "target service is not published" {
+		t.Fatalf("structured error=%+v", remote)
+	}
+	err := coordinatorResponseError(&http.Response{
+		StatusCode: missing.Code, Status: "404 Not Found", Body: io.NopCloser(bytes.NewReader(missing.Body.Bytes())),
+	})
+	if err == nil || !strings.Contains(err.Error(), "published_service_missing") || !strings.Contains(err.Error(), remote.Message) {
+		t.Fatalf("parsed coordinator error=%v", err)
+	}
+
+	created := decodeConnection(t, fixture.call(t, "source", "/v1/connections/request", createConnectionInput{
+		IdempotencyKey: "rejection-reason", TargetNode: "target", Service: "svc",
+	}))
+	rejected := decodeConnection(t, fixture.call(t, "target", "/v1/connections/reject", connectionIDInput{
+		RequestID: created.ID, Reason: "service is under maintenance",
+	}))
+	if rejected.State != "rejected" || rejected.Reason != "service is under maintenance" {
+		t.Fatalf("rejection=%+v", rejected)
+	}
+	status := decodeConnection(t, fixture.call(t, "source", "/v1/connections/status", connectionStatusWaitInput{RequestID: created.ID}))
+	if status.Reason != rejected.Reason {
+		t.Fatalf("source reason=%q, want %q", status.Reason, rejected.Reason)
 	}
 }
 
@@ -258,6 +297,45 @@ func TestHeartbeatAndRevisionDiscoveryAreIndependent(t *testing.T) {
 	var changed discoveryResponse
 	if err := json.Unmarshal(discovery.Body.Bytes(), &changed); err != nil || !changed.Changed {
 		t.Fatalf("changed discovery err=%v body=%s", err, discovery.Body)
+	}
+}
+
+func TestHeartbeatLeaseRenewalDoesNotAdvanceRevisionEveryTime(t *testing.T) {
+	fixture := newConnectionTestRegistry(t)
+	fixture.registry.mu.Lock()
+	publisher := fixture.registry.state.Nodes["source"]
+	publisher.Services = []publishedService{{
+		NodeID: "source", Name: "published", Segment: "home", UUID: "uuid",
+		PinnedSHA256: stringsOfHex("b"), DirectCandidates: []directCandidate{{Address: "10.0.0.2:9443"}},
+	}}
+	fixture.registry.state.Nodes["source"] = publisher
+	fixture.registry.mu.Unlock()
+
+	heartbeat := func() heartbeatResponse {
+		t.Helper()
+		recorder := fixture.call(t, "source", "/v1/nodes/heartbeat", discoveryRequest{Node: publisher})
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("heartbeat status=%d body=%s", recorder.Code, recorder.Body)
+		}
+		var response heartbeatResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	first, second := heartbeat(), heartbeat()
+	if first.Revision != second.Revision {
+		t.Fatalf("lease-only heartbeat advanced revision: %d -> %d", first.Revision, second.Revision)
+	}
+
+	fixture.registry.mu.Lock()
+	stored := fixture.registry.state.Nodes["source"]
+	stored.Services[0].DirectCandidates[0].ExpiresAt = time.Now().Add(directCandidateLease / 3)
+	fixture.registry.state.Nodes["source"] = stored
+	fixture.registry.mu.Unlock()
+	third := heartbeat()
+	if third.Revision <= second.Revision {
+		t.Fatal("expiring direct-candidate lease did not refresh discovery")
 	}
 }
 

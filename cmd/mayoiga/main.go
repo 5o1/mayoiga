@@ -17,7 +17,6 @@ import (
 	"math/big"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -30,16 +29,17 @@ var localeFiles embed.FS
 
 var version = "dev"
 
-const profileVersion = 7
+const profileVersion = 8
 
 type messages map[string]string
+
+var activeMessages messages
 
 type mapping struct {
 	Name              string `json:"name"`
 	Kind              string `json:"kind"`
 	Listen            string `json:"listen"`
 	Target            string `json:"target,omitempty"`
-	Endpoint          string `json:"endpoint,omitempty"`
 	TargetNode        string `json:"target_node,omitempty"`
 	Service           string `json:"service,omitempty"`
 	Upstream          string `json:"upstream,omitempty"`
@@ -54,6 +54,7 @@ type mapping struct {
 type profile struct {
 	Version        int               `json:"version"`
 	Instance       string            `json:"instance"`
+	Disabled       bool              `json:"disabled,omitempty"`
 	Role           string            `json:"role"`
 	Segment        string            `json:"segment"`
 	VirtualNetwork string            `json:"virtual_network"`
@@ -66,35 +67,39 @@ type profile struct {
 }
 
 type relayConfig struct {
-	Listen       string `json:"listen"`
-	Endpoint     string `json:"endpoint"`
-	Priority     int    `json:"priority"`
-	Certificate  string `json:"certificate"`
-	Key          string `json:"key"`
-	PinnedSHA256 string `json:"pinned_sha256"`
+	Listen             string `json:"listen"`
+	Endpoint           string `json:"endpoint"`
+	Priority           int    `json:"priority"`
+	Certificate        string `json:"certificate"`
+	Key                string `json:"key"`
+	PinnedSHA256       string `json:"pinned_sha256"`
+	AdmissionTokenHash string `json:"admission_token_hash,omitempty"`
 }
 
 type subnodeConfig struct {
 	RelayNodeID       string `json:"relay_node_id"`
 	RelayEndpoint     string `json:"relay_endpoint"`
 	RelayPinnedSHA256 string `json:"relay_pinned_sha256"`
+	RelayToken        string `json:"relay_token"`
 }
 
 type options struct {
 	lang, role, action, segment, name, kind                    string
-	listen, adminListen, target, endpoint, targetNode, service string
+	listen, adminListen, target, targetNode, service           string
 	transitListen, transitEndpoint                             string
 	upstreamRelayNode, upstreamRelayEndpoint, upstreamRelayPin string
+	upstreamRelayToken                                         string
 	requestID, idempotencyKey                                  string
+	reason                                                     string
 	config, output, coordinator, coordinatorPin, deviceCode    string
 	managerDir                                                 string
-	network, advertise, nodeName, nodeID, instance             string
+	network, nodeName, nodeID, instance                        string
 	handshakeStatus                                            int
 	relayPriority                                              int
 	connectionWaitSeconds, connectionTTLSeconds                int
 	connectionLeaseSeconds, connectionMaxPending               int
 	set                                                        map[string]bool
-	yes, replaceExisting, showVersion                          bool
+	yes, replaceExisting, rotateRelayToken, showVersion        bool
 }
 
 func main() {
@@ -109,17 +114,16 @@ func main() {
 	flag.StringVar(&o.coordinatorPin, "coordinator-pin", "", "coordinator certificate SHA-256")
 	flag.StringVar(&o.deviceCode, "device-code", "", "one-time enrollment device code")
 	flag.IntVar(&o.handshakeStatus, "handshake-status", 0, "filter handshake history by status code")
-	flag.StringVar(&o.advertise, "advertise", "", "comma-separated reachable node endpoints")
 	flag.StringVar(&o.nodeName, "node-name", "", "node display name (default: hostname)")
 	flag.StringVar(&o.nodeID, "node-id", "", "authorized node ID")
 	flag.StringVar(&o.requestID, "request-id", "", "connection request ID")
 	flag.StringVar(&o.idempotencyKey, "idempotency-key", "", "connection request idempotency key")
+	flag.StringVar(&o.reason, "reason", "", "human-readable connection decision reason")
 	flag.StringVar(&o.name, "name", "", "mapping name")
 	flag.StringVar(&o.kind, "kind", "", "mapping kind: pull or publish")
 	flag.StringVar(&o.listen, "listen", "", "listen address in host:port form")
 	flag.StringVar(&o.adminListen, "admin-listen", "", "coordinator loopback-only admin listen address")
 	flag.StringVar(&o.target, "target", "", "reachable target address for publish")
-	flag.StringVar(&o.endpoint, "endpoint", "", "externally reachable encrypted publish endpoint")
 	flag.StringVar(&o.targetNode, "target-node", "", "target node ID for an automatic pull")
 	flag.StringVar(&o.service, "service", "", "published service name for an automatic pull")
 	flag.StringVar(&o.transitListen, "transit-listen", "", "relay transit listen address")
@@ -127,6 +131,7 @@ func main() {
 	flag.StringVar(&o.upstreamRelayNode, "upstream-relay-node", "", "upstream relay node ID for a subnode")
 	flag.StringVar(&o.upstreamRelayEndpoint, "upstream-relay-endpoint", "", "reachable upstream relay endpoint for a subnode")
 	flag.StringVar(&o.upstreamRelayPin, "upstream-relay-pin", "", "upstream relay certificate SHA-256 for a subnode")
+	flag.StringVar(&o.upstreamRelayToken, "upstream-relay-token", "", "relay admission token for a subnode")
 	flag.IntVar(&o.relayPriority, "relay-priority", 100, "relay preference; lower values are tried first")
 	flag.IntVar(&o.connectionWaitSeconds, "connection-wait-seconds", 25, "coordinator maximum long-poll wait")
 	flag.IntVar(&o.connectionTTLSeconds, "connection-request-ttl-seconds", 120, "connection request lifetime")
@@ -137,6 +142,7 @@ func main() {
 	flag.StringVar(&o.output, "output", "", "rendered Xray JSON output path")
 	flag.BoolVar(&o.yes, "yes", false, "confirm node deletion")
 	flag.BoolVar(&o.replaceExisting, "replace-existing", false, "approve replacing an existing node credential")
+	flag.BoolVar(&o.rotateRelayToken, "rotate-relay-token", false, "replace a relay's subnode admission token")
 	flag.BoolVar(&o.showVersion, "version", false, "print version")
 	flag.Parse()
 	o.set = make(map[string]bool)
@@ -153,6 +159,7 @@ func main() {
 		o.lang = "en"
 	}
 	msg, _ := loadLocale(o.lang)
+	activeMessages = msg
 	if o.action == "" {
 		if err := interactive(&o, msg); err != nil {
 			fatal(err)
@@ -175,6 +182,15 @@ func loadLocale(name string) (messages, error) {
 	}
 	var m messages
 	return m, json.Unmarshal(b, &m)
+}
+
+func localizedError(code, fallback string) string {
+	if activeMessages != nil {
+		if message := activeMessages["error."+code]; message != "" {
+			return message
+		}
+	}
+	return fallback
 }
 
 func chooseLanguage() string {
@@ -237,10 +253,11 @@ func interactive(o *options, m messages) error {
 				return fmt.Errorf("load node %q: %w", o.instance, err)
 			}
 			o.role, o.nodeName, o.network, o.segment = p.Role, p.Node.Name, p.VirtualNetwork, p.Segment
-			o.advertise, o.coordinator, o.coordinatorPin, o.listen, o.adminListen = strings.Join(p.Node.Endpoints, ","), p.Coordinator.URL, p.Coordinator.PinnedSHA256, p.Server.Listen, p.Server.AdminListen
+			o.coordinator, o.coordinatorPin, o.listen, o.adminListen = p.Coordinator.URL, p.Coordinator.PinnedSHA256, p.Server.Listen, p.Server.AdminListen
 			o.transitListen, o.transitEndpoint, o.relayPriority = p.Relay.Listen, p.Relay.Endpoint, p.Relay.Priority
 			o.upstreamRelayNode, o.upstreamRelayEndpoint, o.upstreamRelayPin =
 				p.Subnode.RelayNodeID, p.Subnode.RelayEndpoint, p.Subnode.RelayPinnedSHA256
+			o.upstreamRelayToken = p.Subnode.RelayToken
 			o.connectionWaitSeconds, o.connectionTTLSeconds = p.Server.ConnectionWaitSeconds, p.Server.ConnectionRequestTTLSeconds
 			o.connectionLeaseSeconds, o.connectionMaxPending = p.Server.ConnectionOfferLeaseSeconds, p.Server.ConnectionMaxPending
 		}
@@ -261,7 +278,6 @@ func interactive(o *options, m messages) error {
 		askEdit(in, m["prompt.node_name"], &o.nodeName, "node-name", o.set, configure)
 		askEdit(in, m["prompt.network"], &o.network, "network", o.set, configure)
 		askEdit(in, m["prompt.segment"], &o.segment, "segment", o.set, configure)
-		askEdit(in, m["prompt.advertise"], &o.advertise, "advertise", o.set, configure)
 		if o.role == "coordinator" {
 			askEdit(in, m["prompt.coordinator_listen"], &o.listen, "listen", o.set, configure)
 			askEdit(in, m["prompt.admin_listen"], &o.adminListen, "admin-listen", o.set, configure)
@@ -299,6 +315,7 @@ func interactive(o *options, m messages) error {
 				askEdit(in, m["prompt.upstream_relay_node"], &o.upstreamRelayNode, "upstream-relay-node", o.set, configure)
 				askEdit(in, m["prompt.upstream_relay_endpoint"], &o.upstreamRelayEndpoint, "upstream-relay-endpoint", o.set, configure)
 				askEdit(in, m["prompt.upstream_relay_pin"], &o.upstreamRelayPin, "upstream-relay-pin", o.set, configure)
+				askSecretEdit(in, m["prompt.upstream_relay_token"], &o.upstreamRelayToken, "upstream-relay-token", o.set, configure)
 			}
 			askEdit(in, m["prompt.coordinator"], &o.coordinator, "coordinator", o.set, configure)
 			if o.coordinator != "" {
@@ -315,6 +332,11 @@ func interactive(o *options, m messages) error {
 			fmt.Print(m["prompt.replace_existing"])
 			in.Scan()
 			o.replaceExisting = strings.EqualFold(strings.TrimSpace(in.Text()), "yes")
+		}
+		if o.action == "reject" {
+			fmt.Print(m["prompt.reason"])
+			in.Scan()
+			o.reason = strings.TrimSpace(in.Text())
 		}
 	}
 	if o.action == "revoke" {
@@ -336,9 +358,6 @@ func interactive(o *options, m messages) error {
 			fmt.Print(m["prompt.target"])
 			in.Scan()
 			o.target = in.Text()
-			fmt.Print(m["prompt.endpoint"])
-			in.Scan()
-			o.endpoint = in.Text()
 		} else {
 			fmt.Print(m["prompt.target_node"])
 			in.Scan()
@@ -367,6 +386,11 @@ func interactive(o *options, m messages) error {
 		in.Scan()
 		o.requestID = strings.TrimSpace(in.Text())
 	}
+	if o.action == "reject-connection" || o.action == "cancel-connection" {
+		fmt.Print(m["prompt.reason"])
+		in.Scan()
+		o.reason = strings.TrimSpace(in.Text())
+	}
 	if o.action == "delete-node" {
 		fmt.Print(m["prompt.confirm"])
 		in.Scan()
@@ -378,6 +402,22 @@ func interactive(o *options, m messages) error {
 func askEdit(in *bufio.Scanner, prompt string, target *string, flagName string, set map[string]bool, preserve bool) {
 	if preserve && *target != "" {
 		fmt.Printf("%s[%s] ", prompt, *target)
+	} else {
+		fmt.Print(prompt)
+	}
+	in.Scan()
+	value := strings.TrimSpace(in.Text())
+	if value != "" {
+		if value == "-" {
+			value = ""
+		}
+		*target, set[flagName] = value, true
+	}
+}
+
+func askSecretEdit(in *bufio.Scanner, prompt string, target *string, flagName string, set map[string]bool, preserve bool) {
+	if preserve && *target != "" {
+		fmt.Printf("%s[configured] ", prompt)
 	} else {
 		fmt.Print(prompt)
 	}
@@ -441,7 +481,7 @@ func execute(o options) error {
 	case "start":
 		return start(o.instance, path, o.config == "")
 	case "stop":
-		return stop(o.instance, o.config == "")
+		return stop(path, o.config == "")
 	case "delete-node":
 		if !o.yes {
 			return errors.New("--yes is required")
@@ -462,7 +502,7 @@ func execute(o options) error {
 	case "approve":
 		return approveDeviceCode(path, o.deviceCode, o.replaceExisting)
 	case "reject":
-		return rejectDeviceCode(path, o.deviceCode)
+		return rejectDeviceCode(path, o.deviceCode, o.reason)
 	case "revoke":
 		return revokeNodeID(path, o.nodeID)
 	case "sync":
@@ -476,11 +516,11 @@ func execute(o options) error {
 	case "connection-inbox":
 		return printConnectionInbox(path)
 	case "accept-connection":
-		return decideConnectionCLI(path, o.requestID, "accept")
+		return decideConnectionCLI(path, o.requestID, "accept", o.reason)
 	case "reject-connection":
-		return decideConnectionCLI(path, o.requestID, "reject")
+		return decideConnectionCLI(path, o.requestID, "reject", o.reason)
 	case "cancel-connection":
-		return decideConnectionCLI(path, o.requestID, "cancel")
+		return decideConnectionCLI(path, o.requestID, "cancel", o.reason)
 	case "run":
 		return runProfile(path)
 	default:
@@ -583,16 +623,8 @@ func install(o options, path string, configure bool) error {
 			p.Node.Name, _ = os.Hostname()
 		}
 	}
-	if !configure || o.set["advertise"] {
-		p.Node.Endpoints = splitList(o.advertise)
-		for _, endpoint := range p.Node.Endpoints {
-			if err := validateHostPort(endpoint); err != nil {
-				return fmt.Errorf("invalid advertised endpoint %q: %w", endpoint, err)
-			}
-		}
-	}
-
 	needsEnrollment := false
+	generatedRelayToken := ""
 	if p.Role == "coordinator" && (!configure || o.set["listen"] || o.set["admin-listen"] ||
 		o.set["connection-wait-seconds"] || o.set["connection-request-ttl-seconds"] ||
 		o.set["connection-offer-lease-seconds"] || o.set["connection-max-pending"] ||
@@ -688,6 +720,9 @@ func install(o options, path string, configure bool) error {
 		}
 		fmt.Printf("COORDINATOR_PIN=%s\n", p.Server.PinnedSHA256)
 	}
+	if o.rotateRelayToken && p.Role != "relay" {
+		return errors.New("--rotate-relay-token requires a relay node")
+	}
 	if p.Role == "relay" {
 		if configure && !o.set["transit-listen"] {
 			o.transitListen = p.Relay.Listen
@@ -730,6 +765,15 @@ func install(o options, path string, configure bool) error {
 			}
 			p.Relay.PinnedSHA256 = pin
 		}
+		if o.rotateRelayToken || p.Relay.AdmissionTokenHash == "" {
+			generatedRelayToken, err = randomToken()
+			if err != nil {
+				return fmt.Errorf("generate relay admission token: %w", err)
+			}
+			p.Relay.AdmissionTokenHash = relayAdmissionTokenHash(generatedRelayToken)
+		} else if !validRelayAdmissionTokenHash(p.Relay.AdmissionTokenHash) {
+			return errors.New("relay admission token configuration is invalid")
+		}
 		fmt.Printf("RELAY_PIN=%s\n", p.Relay.PinnedSHA256)
 	} else if configure && o.set["role"] {
 		p.Relay = relayConfig{}
@@ -744,8 +788,11 @@ func install(o options, path string, configure bool) error {
 		if configure && !o.set["upstream-relay-pin"] {
 			o.upstreamRelayPin = p.Subnode.RelayPinnedSHA256
 		}
-		if o.upstreamRelayNode == "" || o.upstreamRelayEndpoint == "" || o.upstreamRelayPin == "" {
-			return errors.New("--upstream-relay-node, --upstream-relay-endpoint, and --upstream-relay-pin are required for a subnode")
+		if configure && !o.set["upstream-relay-token"] {
+			o.upstreamRelayToken = p.Subnode.RelayToken
+		}
+		if o.upstreamRelayNode == "" || o.upstreamRelayEndpoint == "" || o.upstreamRelayPin == "" || o.upstreamRelayToken == "" {
+			return errors.New("--upstream-relay-node, --upstream-relay-endpoint, --upstream-relay-pin, and --upstream-relay-token are required for a subnode")
 		}
 		if err := validateHostPort(o.upstreamRelayEndpoint); err != nil {
 			return fmt.Errorf("invalid upstream relay endpoint: %w", err)
@@ -755,7 +802,7 @@ func install(o options, path string, configure bool) error {
 		}
 		p.Subnode = subnodeConfig{
 			RelayNodeID: o.upstreamRelayNode, RelayEndpoint: o.upstreamRelayEndpoint,
-			RelayPinnedSHA256: normalizePin(o.upstreamRelayPin),
+			RelayPinnedSHA256: normalizePin(o.upstreamRelayPin), RelayToken: strings.TrimSpace(o.upstreamRelayToken),
 		}
 	} else if configure && o.set["role"] {
 		p.Subnode = subnodeConfig{}
@@ -786,16 +833,19 @@ func install(o options, path string, configure bool) error {
 	if err := saveProfile(path, p); err != nil {
 		return err
 	}
+	if generatedRelayToken != "" {
+		fmt.Printf("SUBNODE_RELAY_TOKEN=%s\n", generatedRelayToken)
+	}
 	if needsEnrollment {
 		if err := requestEnrollment(context.Background(), path, &p); err != nil {
 			return fmt.Errorf("create coordinator handshake: %w", err)
 		}
 	}
 	if runtime.GOOS == "linux" && o.config == "" {
-		if err := installNodeUnit(o.instance); err != nil {
+		if err := ensureManagerService(); err != nil {
 			return err
 		}
-		fmt.Printf("node %s saved; run: mayoiga --instance %s --action start\n", o.instance, o.instance)
+		fmt.Printf("node %s saved and enabled; run: mayoiga --action service-start\n", o.instance)
 	} else {
 		fmt.Printf("node %s saved\n", o.instance)
 	}
@@ -810,14 +860,11 @@ func addMapping(o options, path string) error {
 		return errors.New("--kind must be pull or publish; relay capability belongs to a relay node")
 	}
 	if o.kind == "publish" {
-		if o.target == "" || o.endpoint == "" {
-			return errors.New("--target and --endpoint are required for publish")
+		if o.target == "" {
+			return errors.New("--target is required for publish")
 		}
 		if err := validateHostPort(o.target); err != nil {
 			return fmt.Errorf("invalid publish target address: %w", err)
-		}
-		if err := validateHostPort(o.endpoint); err != nil {
-			return fmt.Errorf("invalid publish endpoint: %w", err)
 		}
 	} else if o.targetNode == "" || o.service == "" {
 		return errors.New("--target-node and --service are required for pull")
@@ -849,7 +896,7 @@ func addMapping(o options, path string) error {
 		return fmt.Errorf("mapping port conflict at %s: %w", o.listen, err)
 	}
 	m := mapping{
-		Name: o.name, Kind: o.kind, Listen: o.listen, Target: o.target, Endpoint: o.endpoint,
+		Name: o.name, Kind: o.kind, Listen: o.listen, Target: o.target,
 		TargetNode: o.targetNode, Service: o.service,
 	}
 	if o.kind == "publish" {
@@ -1006,34 +1053,36 @@ func formatStatusTime(value time.Time) string {
 	return value.Format(time.RFC3339)
 }
 func start(instance, path string, managed bool) error {
-	if runtime.GOOS == "linux" && managed {
-		unit := "mayoiga@" + instance + ".service"
-		if exec.Command("systemctl", "--user", "is-active", "--quiet", unit).Run() == nil {
-			c := exec.Command("systemctl", "--user", "restart", unit)
-			c.Stdout = os.Stdout
-			c.Stderr = os.Stderr
-			return c.Run()
-		}
-		c := exec.Command("systemctl", "--user", "enable", "--now", unit)
-		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
-		return c.Run()
+	if !managed {
+		return errors.New("--action start requires a managed node; use --action run for a foreground custom profile")
 	}
-	return runProfile(path)
+	if err := setNodeDisabled(path, false); err != nil {
+		return err
+	}
+	if runtime.GOOS != "linux" {
+		return errors.New("start the rootless manager with --action service-run on this platform")
+	}
+	return controlManagerService("start")
 }
-func stop(instance string, managed bool) error {
-	if runtime.GOOS != "linux" || !managed {
-		return errors.New("stop is managed by the invoking process on this platform")
+func stop(path string, managed bool) error {
+	if !managed {
+		return errors.New("--action stop requires a managed node; stop a foreground custom profile from its invoking process")
 	}
-	c := exec.Command("systemctl", "--user", "disable", "--now", "mayoiga@"+instance+".service")
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	return c.Run()
+	return setNodeDisabled(path, true)
+}
+
+func setNodeDisabled(path string, disabled bool) error {
+	p, err := loadProfile(path)
+	if err != nil {
+		return err
+	}
+	if p.Disabled == disabled {
+		return nil
+	}
+	p.Disabled = disabled
+	return saveProfile(path, p)
 }
 func uninstall(instance, path string, managed bool) error {
-	if runtime.GOOS == "linux" && managed {
-		_ = stop(instance, true)
-	}
 	if managed {
 		return os.RemoveAll(filepath.Dir(path))
 	}

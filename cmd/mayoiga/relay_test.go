@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -44,7 +47,7 @@ func TestRegisteredRelayEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	targetMapping := mapping{
-		Name: "echo", Kind: "publish", Listen: publishListen, Endpoint: publishListen,
+		Name: "echo", Kind: "publish", Listen: publishListen,
 		Target: echoAddress, UUID: publishUUID,
 		Certificate: publishCertificate, Key: publishKey, CertificateSHA256: publishPin,
 	}
@@ -98,7 +101,7 @@ func TestRegisteredRelayEndToEnd(t *testing.T) {
 		paths[name] = path
 	}
 
-	for _, name := range []string{"target", "relay", "source", "relay", "source"} {
+	for _, name := range []string{"target", "relay", "source", "relay", "source", "target"} {
 		if _, err := syncDiscovery(context.Background(), paths[name], profiles[name]); err != nil {
 			t.Fatalf("%s sync: %v", name, err)
 		}
@@ -113,6 +116,9 @@ func TestRegisteredRelayEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer transit.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go runInboxWorker(ctx, paths["target"], *profiles["target"])
 	pullListen := freeAddress(t)
 	pull, err := startSmartPull(*profiles["source"], paths["source"], mapping{
 		Name: "echo", Kind: "pull", Listen: pullListen, TargetNode: "target", Service: "echo",
@@ -141,7 +147,7 @@ func TestCrossSegmentRelayPublishesThroughItsOwnTransit(t *testing.T) {
 		t.Fatal(err)
 	}
 	publish := mapping{
-		Name: "echo", Kind: "publish", Listen: publishListen, Endpoint: publishListen,
+		Name: "echo", Kind: "publish", Listen: publishListen,
 		Target: echoAddress, UUID: publishUUID, Certificate: publishCertificate,
 		Key: publishKey, CertificateSHA256: publishPin,
 	}
@@ -182,6 +188,9 @@ func TestCrossSegmentRelayPublishesThroughItsOwnTransit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Dir(sourcePath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveProfile(sourcePath, sourceProfile); err != nil {
 		t.Fatal(err)
 	}
 	if err := saveDiscovered(relayPath, []discoveredNode{sourceNode}); err != nil {
@@ -227,7 +236,6 @@ func TestOnDemandReverseConnectionThroughSourceRelay(t *testing.T) {
 	echoAddress, closeEcho := startEchoServer(t)
 	defer closeEcho()
 	publishListen := freeAddress(t)
-	deadAdvertisedEndpoint := freeAddress(t)
 	publishCertificate := filepath.Join(dir, "school-publish.crt")
 	publishKey := filepath.Join(dir, "school-publish.key")
 	publishPin, err := makeCertificate(publishCertificate, publishKey)
@@ -240,7 +248,9 @@ func TestOnDemandReverseConnectionThroughSourceRelay(t *testing.T) {
 	}
 	schoolPublish := mapping{
 		Name: "school-service", Kind: "publish", Listen: publishListen,
-		Endpoint: deadAdvertisedEndpoint, Target: echoAddress, UUID: publishUUID,
+		// The school node is behind NAT.  No publisher endpoint is configured;
+		// the relay must reach it through the outbound reverse offer.
+		Target: echoAddress, UUID: publishUUID,
 		Certificate: publishCertificate, Key: publishKey, CertificateSHA256: publishPin,
 	}
 
@@ -298,11 +308,9 @@ func TestOnDemandReverseConnectionThroughSourceRelay(t *testing.T) {
 		}
 	}
 
-	publisher, err := startMapping(schoolPublish)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer publisher.Close()
+	// A reverse offer dials the local publish target directly. It must not need
+	// a second local VLESS/Xray listener before it can bridge the encrypted
+	// return connection.
 	transit, err := startRelayServer(*profiles["home-relay"], paths["home-relay"])
 	if err != nil {
 		t.Fatal(err)
@@ -358,7 +366,7 @@ func TestReverseBrokerBindsRequestTargetAndService(t *testing.T) {
 	left, right := net.Pipe()
 	defer left.Close()
 	defer right.Close()
-	ready.connection <- left
+	go func() { ready.connection <- left }()
 	if got := <-connectionReady; got != left {
 		t.Fatal("broker delivered the wrong connection")
 	}
@@ -373,6 +381,99 @@ func TestReverseBrokerBindsRequestTargetAndService(t *testing.T) {
 	case <-expectation.done:
 	default:
 		t.Fatal("taken expectation did not observe source cancellation")
+	}
+}
+
+func TestReverseDialWaitsForRelayConfirmation(t *testing.T) {
+	dir := t.TempDir()
+	certificatePath, keyPath := filepath.Join(dir, "relay.crt"), filepath.Join(dir, "relay.key")
+	pin, err := makeCertificate(certificatePath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := tls.LoadX509KeyPair(certificatePath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{certificate}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	credential := testNodeCredential(t)
+	local := profile{
+		Version: profileVersion, Instance: "target", Role: "client", Segment: "home", VirtualNetwork: "mesh",
+		Node: nodeConfig{ID: "target", Name: "target"}, Coordinator: coordinatorClient{Credential: &credential},
+	}
+	relay := discoveredNode{ID: "relay", Relay: &relayAdvertisement{Endpoint: listener.Addr().String(), PinnedSHA256: pin}}
+	received, allowConfirmation := make(chan struct{}), make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		connection, err := listener.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer connection.Close()
+		_ = connection.SetDeadline(time.Now().Add(time.Second))
+		line, err := bufio.NewReader(connection).ReadString('\n')
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		var handshake relayHandshake
+		if err := json.Unmarshal([]byte(line), &handshake); err != nil || handshake.Mode != "reverse" {
+			serverErr <- fmt.Errorf("reverse handshake=%+v err=%v", handshake, err)
+			return
+		}
+		close(received)
+		<-allowConfirmation
+		_, err = io.WriteString(connection, "OK\n")
+		serverErr <- err
+	}()
+
+	result := make(chan error, 1)
+	go func() {
+		connection, err := dialReverseRelay(local, relay, "request", "service")
+		if connection != nil {
+			connection.Close()
+		}
+		result <- err
+	}()
+	<-received
+	select {
+	case err := <-result:
+		t.Fatalf("reverse dial returned before relay confirmation: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowConfirmation)
+	if err := <-result; err != nil {
+		t.Fatalf("reverse dial after confirmation: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRelayErrorResponseKeepsCodeAndExplanation(t *testing.T) {
+	err := relayResponseError("ERR coordinator_tunnel_unauthorized relay token is invalid\n")
+	if err == nil || !strings.Contains(err.Error(), "coordinator_tunnel_unauthorized") || !strings.Contains(err.Error(), "relay token is invalid") {
+		t.Fatalf("relay error=%v", err)
+	}
+}
+
+func TestSubnodeGatewayAuthorizationScansAllPeers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profile.json")
+	relay := relayServer{profile: profile{Segment: "home", Node: nodeConfig{ID: "home-relay"}}, path: path}
+	if err := saveDiscovered(path, []discoveredNode{
+		{ID: "ordinary-client", Role: "client", Segment: "home"},
+		{ID: "offline", Role: "subnode", Segment: "home", UpstreamRelay: "home-relay"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !relay.isAuthorizedSubnodeGateway("offline") {
+		t.Fatal("authorized subnode after another peer was not found")
 	}
 }
 
@@ -430,6 +531,7 @@ func TestSubnodeEnrollsSyncsAndRoutesOnlyThroughUpstreamRelay(t *testing.T) {
 		Relay: relayConfig{
 			Listen: relayListen, Endpoint: relayListen, Priority: 10,
 			Certificate: relayCertificate, Key: relayKey, PinnedSHA256: relayPin,
+			AdmissionTokenHash: relayAdmissionTokenHash("subnode-token"),
 		},
 	}
 	relayPath := filepath.Join(dir, "relay", "profile.json")
@@ -496,7 +598,7 @@ func TestSubnodeEnrollsSyncsAndRoutesOnlyThroughUpstreamRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	publish := mapping{
-		Name: "echo", Kind: "publish", Listen: publishListen, Endpoint: publishListen,
+		Name: "echo", Kind: "publish", Listen: publishListen,
 		Target: echoAddress, UUID: publishUUID, Certificate: publishCertificate,
 		Key: publishKey, CertificateSHA256: publishPin,
 	}
@@ -522,16 +624,25 @@ func TestSubnodeEnrollsSyncsAndRoutesOnlyThroughUpstreamRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer publisher.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go runInboxWorker(ctx, targetPath, targetProfile)
 
 	subnodeProfile := profile{
 		Version: profileVersion, Instance: "offline", Role: "subnode",
-		Segment: "home", VirtualNetwork: "mesh", Node: nodeConfig{ID: "offline", Name: "offline"},
+		Segment: "home", VirtualNetwork: "mesh", Node: nodeConfig{ID: "offline", Name: "z-offline"},
 		Coordinator: coordinatorClient{URL: coordinator.URL, PinnedSHA256: coordinatorPin},
 		Subnode: subnodeConfig{
-			RelayNodeID: "relay", RelayEndpoint: relayListen, RelayPinnedSHA256: relayPin,
+			RelayNodeID: "relay", RelayEndpoint: relayListen, RelayPinnedSHA256: relayPin, RelayToken: "subnode-token",
 		},
 	}
 	subnodePath := filepath.Join(dir, "offline", "profile.json")
+	if connection, err := dialCoordinatorViaRelay(context.Background(), "mesh", "untrusted", subnodeConfig{
+		RelayNodeID: "relay", RelayEndpoint: relayListen, RelayPinnedSHA256: relayPin, RelayToken: "incorrect-token",
+	}); err == nil {
+		connection.Close()
+		t.Fatal("relay accepted a coordinator tunnel without its admission token")
+	}
 	if err := requestEnrollment(context.Background(), subnodePath, &subnodeProfile); err != nil {
 		t.Fatalf("subnode enrollment through relay: %v", err)
 	}
@@ -577,7 +688,7 @@ func TestTargetSideRelayFailoverAndDirectFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	publish := mapping{
-		Name: "echo", Kind: "publish", Listen: publishListen, Endpoint: publishListen,
+		Name: "echo", Kind: "publish", Listen: publishListen,
 		Target: echoAddress, UUID: publishUUID,
 		Certificate: publishCertificate, Key: publishKey, CertificateSHA256: publishPin,
 	}
@@ -587,7 +698,7 @@ func TestTargetSideRelayFailoverAndDirectFallback(t *testing.T) {
 	}
 	defer publishInstance.Close()
 	service := publishedService{
-		NodeID: "target", Name: "echo", Segment: "home", Endpoint: publishListen,
+		NodeID: "target", Name: "echo", Segment: "home", DirectCandidates: []directCandidate{{Address: publishListen}},
 		UUID: publishUUID, PinnedSHA256: publishPin,
 	}
 	target := discoveredNode{
@@ -665,6 +776,10 @@ func TestTargetSideRelayFailoverAndDirectFallback(t *testing.T) {
 		t.Fatal("failed first relay was not placed in cooldown")
 	}
 
+	sourceProfile.Segment = "home"
+	if err := saveProfile(sourceProfilePath, sourceProfile); err != nil {
+		t.Fatal(err)
+	}
 	if err := saveDiscovered(sourceProfilePath, []discoveredNode{target, deadRelay}); err != nil {
 		t.Fatal(err)
 	}

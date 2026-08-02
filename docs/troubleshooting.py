@@ -5,14 +5,23 @@ def troubleshooting():
     """# Troubleshooting
 
     Run `./mayoiga --instance NAME --action status` and inspect
-    `journalctl --user -u mayoiga@NAME`. Use `--action render` with the same
-    instance to inspect generated Xray JSON without starting listeners.
+    `journalctl --user -u mayoiga`. The rootless manager notices profile
+    changes within five seconds and performs a full restart rather than a hot
+    reload. It keeps the previous worker if the new profile fails static
+    validation; correct the reported profile error and save again. Use
+    `--action render` with the same instance to inspect generated Xray JSON
+    without starting listeners.
 
-    Connection failures usually mean a published or transit listener is
-    firewalled, router forwarding is missing, or its advertised `--endpoint`
-    is wrong. Run `--action nodes` to verify the target node ID, service, relay
-    priority, and last heartbeat. A successful encrypted connection followed
-    by refusal means the publisher cannot reach its configured `--target`.
+    Connection failures usually mean the target node or its inbox worker is
+    offline, a relay listener is unreachable, or a coordinator-issued direct
+    candidate has expired. A published service does not need a public IP,
+    router forwarding, or a manually configured address: candidates are
+    derived at runtime, leased for 90 seconds, and visible only in the same
+    segment.
+    The publisher otherwise initiates the reverse stream to the relay. Run
+    `--action nodes` to verify the target node ID, service, relay priority,
+    and last heartbeat. A successful encrypted connection followed by refusal
+    means the publisher cannot reach its configured `--target`.
 
     Ports below 1024 normally cannot be bound rootlessly on Linux. Prefer a
     high external port such as 18443 and forward public port 443 at the router
@@ -28,11 +37,12 @@ def troubleshooting():
     reads the last successful `peers.json` cache.
 
     For a subnode, first verify that `--upstream-relay-endpoint` is reachable
-    on the local segment and that `--upstream-relay-pin` and
-    `--upstream-relay-node` identify that exact relay. The relay must be active,
-    registered to the same coordinator, and currently advertising the same
-    virtual network and segment. A subnode never falls back to direct WAN
-    coordinator or service access.
+    on the local segment and that `--upstream-relay-pin`,
+    `--upstream-relay-node`, and the secret `--upstream-relay-token` identify
+    that exact relay. The relay must be active, registered to the same
+    coordinator, and currently advertising the same virtual network and
+    segment. A subnode never falls back to direct WAN coordinator or service
+    access.
 
     `status` reports heartbeat, discovery, and connection-inbox health
     separately. An empty inbox response after the configured wait interval is

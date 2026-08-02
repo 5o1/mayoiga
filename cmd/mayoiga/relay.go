@@ -28,7 +28,14 @@ const (
 	relayHandshakeLimit   = 16 << 10
 	relayDialTimeout      = 5 * time.Second
 	relayFailureCooldown  = 30 * time.Second
+	maxCoordinatorTunnels = 32
 )
+
+// A shared cache allows TLS 1.3 tickets to be reused by the many short-lived
+// reverse connections that a SOCKS proxy naturally creates. Session tickets
+// remain bound to the relay certificate and are still checked by
+// VerifyConnection below.
+var relayClientSessions = tls.NewLRUClientSessionCache(256)
 
 type relayHandshake struct {
 	Version    int    `json:"version"`
@@ -39,6 +46,7 @@ type relayHandshake struct {
 	TargetNode string `json:"target_node"`
 	Service    string `json:"service"`
 	RequestID  string `json:"request_id,omitempty"`
+	RelayToken string `json:"relay_token,omitempty"`
 	Timestamp  int64  `json:"timestamp"`
 	Nonce      string `json:"nonce"`
 	Signature  string `json:"signature"`
@@ -67,7 +75,7 @@ var reverseBroker = reverseConnectionBroker{waiting: make(map[string]*reverseExp
 func (b *reverseConnectionBroker) expect(requestID, targetNode, service string) (<-chan net.Conn, func()) {
 	b.mu.Lock()
 	expectation := &reverseExpectation{
-		targetNode: targetNode, service: service, connection: make(chan net.Conn, 1), done: make(chan struct{}),
+		targetNode: targetNode, service: service, connection: make(chan net.Conn), done: make(chan struct{}),
 	}
 	b.waiting[requestID] = expectation
 	b.mu.Unlock()
@@ -104,20 +112,23 @@ func newConnectorCache() *connectorCache {
 	return &connectorCache{entries: make(map[string]connectorEntry)}
 }
 
-func (c *connectorCache) dial(service publishedService) (net.Conn, error) {
-	keyBytes, _ := json.Marshal(service)
+func (c *connectorCache) dial(service publishedService, upstream string) (net.Conn, error) {
+	keyBytes, _ := json.Marshal(struct {
+		Service  publishedService `json:"service"`
+		Upstream string           `json:"upstream"`
+	}{Service: service, Upstream: upstream})
 	key := string(keyBytes)
 	c.mu.Lock()
 	entry, exists := c.entries[key]
 	if !exists {
-		address, err := freeLoopbackAddress()
+		listenAddress, err := freeLoopbackAddress()
 		if err != nil {
 			c.mu.Unlock()
 			return nil, err
 		}
 		internal := mapping{
-			Name: "route-" + shortHash(key), Kind: "pull", Listen: address,
-			Upstream: service.Endpoint, UUID: service.UUID,
+			Name: "route-" + shortHash(key), Kind: "pull", Listen: listenAddress,
+			Upstream: upstream, UUID: service.UUID,
 			PinnedSHA256: service.PinnedSHA256,
 		}
 		instance, err := startMapping(internal)
@@ -125,11 +136,35 @@ func (c *connectorCache) dial(service publishedService) (net.Conn, error) {
 			c.mu.Unlock()
 			return nil, err
 		}
-		entry = connectorEntry{address: address, instance: instance}
+		entry = connectorEntry{address: listenAddress, instance: instance}
 		c.entries[key] = entry
 	}
 	c.mu.Unlock()
 	return net.DialTimeout("tcp", entry.address, relayDialTimeout)
+}
+
+func (c *connectorCache) dialDirectCandidates(service publishedService) (net.Conn, error) {
+	var lastErr error
+	active := 0
+	for _, candidate := range service.DirectCandidates {
+		if !candidate.ExpiresAt.IsZero() && !candidate.ExpiresAt.After(time.Now()) {
+			continue
+		}
+		active++
+		if err := probePinnedTLS(candidate.Address, service.PinnedSHA256); err != nil {
+			lastErr = err
+			continue
+		}
+		connection, err := c.dial(service, candidate.Address)
+		if err == nil {
+			return connection, nil
+		}
+		lastErr = err
+	}
+	if active == 0 {
+		return nil, errors.New("published service has no active direct candidate")
+	}
+	return nil, fmt.Errorf("all direct candidates failed: %w", lastErr)
 }
 
 func (c *connectorCache) Close() error {
@@ -225,6 +260,15 @@ func (p *smartPull) handle(application net.Conn) {
 		bridge(application, connection)
 		return
 	}
+	tryDirect := current.Segment == target.Segment && target.Role != "subnode"
+	if tryDirect {
+		if connection, err := p.cache.dialDirectCandidates(service); err == nil {
+			bridge(application, connection)
+			return
+		} else if len(service.DirectCandidates) > 0 {
+			fmt.Fprintln(os.Stderr, "mayoiga: coordinator direct candidates unavailable:", err)
+		}
+	}
 	candidates := routeRelayCandidates(current, target, relays)
 	if len(candidates) > 0 {
 		for _, relay := range candidates {
@@ -244,22 +288,10 @@ func (p *smartPull) handle(application net.Conn) {
 			return
 		}
 	}
-	if err := probePinnedTLS(service.Endpoint, service.PinnedSHA256); err != nil {
-		fmt.Fprintln(os.Stderr, "mayoiga: direct target unavailable:", err)
-		if p.tryReverse(application, current, target, service) {
-			return
-		}
+	if p.tryReverse(application, current, target, service) {
 		return
 	}
-	connection, err := p.cache.dial(service)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "mayoiga: direct target:", err)
-		if p.tryReverse(application, current, target, service) {
-			return
-		}
-		return
-	}
-	bridge(application, connection)
+	fmt.Fprintln(os.Stderr, "mayoiga: coordinator direct and relay paths unavailable")
 }
 
 func (p *smartPull) tryReverse(application net.Conn, current profile, target discoveredNode, service publishedService) bool {
@@ -299,9 +331,6 @@ func (p *smartPull) tryReverse(application net.Conn, current profile, target dis
 }
 
 func routeRelayCandidates(current profile, target discoveredNode, relays []discoveredNode) []discoveredNode {
-	if current.Segment == target.Segment && target.Role != "subnode" {
-		return nil
-	}
 	if target.Role == "relay" {
 		if target.Relay == nil {
 			return nil
@@ -384,19 +413,20 @@ func startRelayServer(p profile, profilePath string) (*relayServer, error) {
 	}
 	server := &relayServer{
 		listener: listener, profile: p, path: profilePath, cache: newConnectorCache(),
-		nonces: make(map[string]time.Time),
+		nonces: make(map[string]time.Time), coordinatorTunnels: make(chan struct{}, maxCoordinatorTunnels),
 	}
 	go server.accept()
 	return server, nil
 }
 
 type relayServer struct {
-	listener net.Listener
-	profile  profile
-	path     string
-	cache    *connectorCache
-	mu       sync.Mutex
-	nonces   map[string]time.Time
+	listener           net.Listener
+	profile            profile
+	path               string
+	cache              *connectorCache
+	mu                 sync.Mutex
+	nonces             map[string]time.Time
+	coordinatorTunnels chan struct{}
 }
 
 func (r *relayServer) Close() error {
@@ -426,12 +456,12 @@ func (r *relayServer) handle(connection net.Conn) {
 	reader := bufio.NewReaderSize(connection, relayHandshakeLimit)
 	line, err := reader.ReadString('\n')
 	if err != nil || len(line) > relayHandshakeLimit {
-		writeRelayError(connection, "invalid handshake")
+		writeRelayError(connection, "handshake_invalid", "the relay handshake is invalid or incomplete")
 		return
 	}
 	var handshake relayHandshake
 	if json.Unmarshal([]byte(line), &handshake) != nil {
-		writeRelayError(connection, "invalid handshake")
+		writeRelayError(connection, "handshake_invalid", "the relay handshake is invalid JSON")
 		return
 	}
 	if handshake.Mode == "coordinator" {
@@ -439,45 +469,64 @@ func (r *relayServer) handle(connection net.Conn) {
 		return
 	}
 	if !r.verify(handshake) {
-		writeRelayError(connection, "unauthorized")
+		writeRelayError(connection, "source_unauthorized", "the source node signature is invalid, expired, or unknown")
 		return
 	}
 	if !r.acceptsSourceRoute(handshake.SourceNode) {
-		writeRelayError(connection, "subnode is assigned to another upstream relay")
+		writeRelayError(connection, "source_route_denied", "the subnode is assigned to another upstream relay")
 		return
 	}
 	if handshake.Mode == "reverse" {
 		expectation, expected := reverseBroker.take(handshake.RequestID, handshake.SourceNode, handshake.Service)
 		if handshake.RequestID == "" || !expected {
-			writeRelayError(connection, "reverse connection is not expected")
+			writeRelayError(connection, "reverse_unexpected", "the reverse connection request is no longer pending")
 			return
 		}
-		if _, err := io.WriteString(connection, "OK\n"); err != nil {
-			return
-		}
+		// Transfer only to a live source waiter before confirming success. The
+		// publisher must not mark a coordinator request accepted merely because
+		// its TCP write reached the relay kernel buffer.
 		_ = connection.SetDeadline(time.Time{})
 		select {
-		case expectation.connection <- connection:
+		case expectation.connection <- &bufferedConn{Conn: connection, reader: reader}:
+			if _, err := io.WriteString(connection, "OK\n"); err != nil {
+				return
+			}
 			transferred = true
 		case <-expectation.done:
 		}
 		return
 	}
 	if handshake.Mode != "service" {
-		writeRelayError(connection, "unsupported handshake mode")
+		writeRelayError(connection, "mode_unsupported", "the relay handshake mode is unsupported")
 		return
 	}
+	// A NAT reverse offer is delivered through the target's independent inbox
+	// worker and may take a full long-poll interval.  Keep the inbound request
+	// alive for the request lifetime while the relay waits for that offer.
+	_ = connection.SetDeadline(time.Now().Add(connectionRequestLifetime))
 	targetNode, service, relays, err := resolveRoute(r.profile, r.path, mapping{TargetNode: handshake.TargetNode, Service: handshake.Service})
 	if err != nil {
-		writeRelayError(connection, "target service is unavailable")
+		writeRelayError(connection, "target_service_missing", "the target node or published service is unavailable")
 		return
 	}
 	var target net.Conn
 	if service.Segment == r.profile.Segment {
-		target, err = r.dialService(service)
+		if targetNode.ID == r.profile.Node.ID {
+			local, exists := localPublishedService(r.profile, service.Name)
+			if !exists {
+				err = errors.New("relay service is not published locally")
+			} else {
+				target, err = r.cache.dialDirectCandidates(local)
+			}
+		} else {
+			target, err = r.dialService(service)
+		}
+		if err != nil {
+			target, err = r.dialReverseService(targetNode, service)
+		}
 	} else {
 		if !r.isAuthorizedSubnodeGateway(handshake.SourceNode) {
-			writeRelayError(connection, "cross-segment gateway route is unauthorized")
+			writeRelayError(connection, "cross_segment_denied", "this source is not authorized for cross-segment gateway routing")
 			return
 		}
 		if targetNode.Role == "relay" {
@@ -493,9 +542,12 @@ func (r *relayServer) handle(connection net.Conn) {
 		if target == nil {
 			target, err = r.dialService(service)
 		}
+		if target == nil {
+			target, err = r.dialReverseService(targetNode, service)
+		}
 	}
 	if err != nil {
-		writeRelayError(connection, "target unavailable")
+		writeRelayError(connection, "target_unavailable", "no authenticated path to the target service is currently available")
 		return
 	}
 	defer target.Close()
@@ -507,10 +559,45 @@ func (r *relayServer) handle(connection net.Conn) {
 }
 
 func (r *relayServer) dialService(service publishedService) (net.Conn, error) {
-	if err := probePinnedTLS(service.Endpoint, service.PinnedSHA256); err != nil {
-		return nil, err
+	return r.cache.dialDirectCandidates(service)
+}
+
+// dialReverseService asks the publisher to connect back to this relay.  The
+// relay therefore never needs the publisher's LAN or public address.  The
+// request id binds the authenticated reverse handshake to this exact target
+// service and the expectation is removed on timeout or cancellation.
+func (r *relayServer) dialReverseService(target discoveredNode, service publishedService) (net.Conn, error) {
+	if r.profile.Coordinator.URL == "" || r.profile.Coordinator.Credential == nil {
+		return nil, errors.New("coordinator credential is unavailable for reverse service")
 	}
-	return r.cache.dial(service)
+	idempotency, err := randomToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate reverse connection token: %w", err)
+	}
+	connectionReady, stopWaiting := reverseBroker.expect(idempotency, target.ID, service.Name)
+	defer stopWaiting()
+	request, err := createConnectionRequest(
+		context.Background(), r.profile, target.ID, service.Name, r.profile.Node.ID, idempotency,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("request reverse service connection: %w", err)
+	}
+	wait := time.Until(request.ExpiresAt)
+	if wait <= 0 {
+		wait = connectionRequestLifetime
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case connection := <-connectionReady:
+		if connection == nil {
+			return nil, errors.New("reverse service connection closed")
+		}
+		return connection, nil
+	case <-timer.C:
+		_, _ = decideConnectionRequest(context.Background(), r.profile, request.ID, "cancel", "reverse service connection timed out")
+		return nil, errors.New("reverse service connection timed out")
+	}
 }
 
 func (r *relayServer) isAuthorizedSubnodeGateway(sourceNode string) bool {
@@ -519,8 +606,10 @@ func (r *relayServer) isAuthorizedSubnodeGateway(sourceNode string) bool {
 		return false
 	}
 	for _, node := range nodes {
-		return node.ID == sourceNode && node.Role == "subnode" &&
-			node.Segment == r.profile.Segment && node.UpstreamRelay == r.profile.Node.ID
+		if node.ID != sourceNode {
+			continue
+		}
+		return node.Role == "subnode" && node.Segment == r.profile.Segment && node.UpstreamRelay == r.profile.Node.ID
 	}
 	return false
 }
@@ -542,19 +631,27 @@ func (r *relayServer) acceptsSourceRoute(sourceNode string) bool {
 
 func (r *relayServer) handleCoordinatorTunnel(connection net.Conn, reader *bufio.Reader, handshake relayHandshake) {
 	if handshake.Version != relayHandshakeVersion || handshake.Network != r.profile.VirtualNetwork ||
-		handshake.RelayNode != r.profile.Node.ID ||
+		handshake.RelayNode != r.profile.Node.ID || handshake.SourceNode == "" ||
+		!r.acceptsCoordinatorTunnel(handshake) ||
 		r.profile.Coordinator.URL == "" {
-		writeRelayError(connection, "coordinator tunnel unavailable")
+		writeRelayError(connection, "coordinator_tunnel_unauthorized", "the relay admission token is missing, invalid, or not assigned to this subnode")
+		return
+	}
+	select {
+	case r.coordinatorTunnels <- struct{}{}:
+		defer func() { <-r.coordinatorTunnels }()
+	default:
+		writeRelayError(connection, "coordinator_tunnel_busy", "the relay has reached its coordinator tunnel capacity; retry shortly")
 		return
 	}
 	coordinatorURL, err := url.Parse(r.profile.Coordinator.URL)
 	if err != nil || coordinatorURL.Host == "" {
-		writeRelayError(connection, "coordinator tunnel unavailable")
+		writeRelayError(connection, "coordinator_tunnel_unavailable", "the relay has no valid upstream coordinator configuration")
 		return
 	}
 	upstream, err := net.DialTimeout("tcp", coordinatorURL.Host, relayDialTimeout)
 	if err != nil {
-		writeRelayError(connection, "coordinator unavailable")
+		writeRelayError(connection, "coordinator_unavailable", "the relay cannot reach its configured coordinator")
 		return
 	}
 	defer upstream.Close()
@@ -563,6 +660,46 @@ func (r *relayServer) handleCoordinatorTunnel(connection net.Conn, reader *bufio
 	}
 	_ = connection.SetDeadline(time.Time{})
 	bridgeReaders(reader, connection, upstream)
+}
+
+// acceptsCoordinatorTunnel permits only a holder of the relay-local admission
+// token to use the otherwise opaque coordinator tunnel. A pending subnode is
+// not in discovery yet, so an unknown source node is allowed only during its
+// credential enrollment; a known source must already be this relay's subnode.
+func (r *relayServer) acceptsCoordinatorTunnel(handshake relayHandshake) bool {
+	if !relayAdmissionTokenMatches(r.profile.Relay.AdmissionTokenHash, handshake.RelayToken) {
+		return false
+	}
+	nodes, err := loadDiscovered(r.path)
+	if err != nil {
+		return false
+	}
+	for _, node := range nodes {
+		if node.ID != handshake.SourceNode {
+			continue
+		}
+		return node.Role == "subnode" && node.Segment == r.profile.Segment && node.UpstreamRelay == r.profile.Node.ID
+	}
+	return true
+}
+
+func relayAdmissionTokenHash(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return hex.EncodeToString(sum[:])
+}
+
+func validRelayAdmissionTokenHash(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func relayAdmissionTokenMatches(expectedHash, token string) bool {
+	expected, err := hex.DecodeString(expectedHash)
+	if err != nil || len(expected) != sha256.Size || strings.TrimSpace(token) == "" {
+		return false
+	}
+	actual, err := hex.DecodeString(relayAdmissionTokenHash(token))
+	return err == nil && subtle.ConstantTimeCompare(expected, actual) == 1
 }
 
 func (r *relayServer) verify(handshake relayHandshake) bool {
@@ -658,7 +795,7 @@ func dialSignedRelay(local profile, relay discoveredNode, mode, targetNode, serv
 	if err != nil || response != "OK\n" {
 		connection.Close()
 		if err == nil {
-			err = fmt.Errorf("relay rejected route: %s", strings.TrimSpace(response))
+			err = relayResponseError(response)
 		}
 		return nil, err
 	}
@@ -666,7 +803,7 @@ func dialSignedRelay(local profile, relay discoveredNode, mode, targetNode, serv
 	return &bufferedConn{Conn: connection, reader: reader}, nil
 }
 
-func dialCoordinatorViaRelay(ctx context.Context, network string, subnode subnodeConfig) (net.Conn, error) {
+func dialCoordinatorViaRelay(ctx context.Context, network, nodeID string, subnode subnodeConfig) (net.Conn, error) {
 	config, err := pinnedTLSConfig(subnode.RelayPinnedSHA256)
 	if err != nil {
 		return nil, err
@@ -680,7 +817,8 @@ func dialCoordinatorViaRelay(ctx context.Context, network string, subnode subnod
 		_ = connection.SetDeadline(deadline)
 	}
 	body, _ := json.Marshal(relayHandshake{
-		Version: relayHandshakeVersion, Mode: "coordinator", Network: network, RelayNode: subnode.RelayNodeID,
+		Version: relayHandshakeVersion, Mode: "coordinator", Network: network, SourceNode: nodeID,
+		RelayNode: subnode.RelayNodeID, RelayToken: subnode.RelayToken,
 	})
 	if _, err := connection.Write(append(body, '\n')); err != nil {
 		connection.Close()
@@ -691,7 +829,7 @@ func dialCoordinatorViaRelay(ctx context.Context, network string, subnode subnod
 	if err != nil || response != "OK\n" {
 		connection.Close()
 		if err == nil {
-			err = fmt.Errorf("relay rejected coordinator tunnel: %s", strings.TrimSpace(response))
+			err = relayResponseError(response)
 		}
 		return nil, err
 	}
@@ -731,6 +869,7 @@ func pinnedTLSConfig(pinText string) (*tls.Config, error) {
 	}
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13, InsecureSkipVerify: true, //nolint:gosec -- exact pin below.
+		ClientSessionCache: relayClientSessions,
 		VerifyConnection: func(state tls.ConnectionState) error {
 			if len(state.PeerCertificates) == 0 {
 				return errors.New("peer sent no certificate")
@@ -744,8 +883,17 @@ func pinnedTLSConfig(pinText string) (*tls.Config, error) {
 	}, nil
 }
 
-func writeRelayError(writer io.Writer, message string) {
-	_, _ = io.WriteString(writer, "ERR "+message+"\n")
+func writeRelayError(writer io.Writer, code, message string) {
+	_, _ = io.WriteString(writer, "ERR "+code+" "+message+"\n")
+}
+
+func relayResponseError(response string) error {
+	response = strings.TrimSpace(response)
+	parts := strings.SplitN(response, " ", 3)
+	if len(parts) == 3 && parts[0] == "ERR" && strings.Contains(parts[1], "_") {
+		return fmt.Errorf("relay %s: %s", parts[1], localizedError(parts[1], parts[2]))
+	}
+	return fmt.Errorf("relay request rejected: %s", response)
 }
 
 func bridge(left, right net.Conn) {

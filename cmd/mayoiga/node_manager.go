@@ -4,9 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 )
@@ -22,29 +20,6 @@ func validateInstance(instance string) error {
 		}
 	}
 	return nil
-}
-
-func installNodeUnit(instance string) error {
-	if err := validateInstance(instance); err != nil {
-		return err
-	}
-	bin, err := stageManagedBinary()
-	if err != nil {
-		return err
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	unitDir := filepath.Join(home, ".config", "systemd", "user")
-	if err := os.MkdirAll(unitDir, 0700); err != nil {
-		return err
-	}
-	unit := "[Unit]\nDescription=mayoiga node %i\nAfter=network-online.target\n\n[Service]\nExecStart=" + bin + " --action run --instance %i\nRestart=on-failure\nRestartSec=3\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=default.target\n"
-	if err := os.WriteFile(filepath.Join(unitDir, "mayoiga@.service"), []byte(unit), 0600); err != nil {
-		return err
-	}
-	return exec.Command("systemctl", "--user", "daemon-reload").Run()
 }
 
 func listNodes() error {
@@ -83,13 +58,9 @@ func listNodes() error {
 				auth = "pending"
 			}
 		}
-		service := "manual"
-		if runtime.GOOS == "linux" {
-			if exec.Command("systemctl", "--user", "is-active", "--quiet", "mayoiga@"+entry.Name()+".service").Run() == nil {
-				service = "active"
-			} else {
-				service = "inactive"
-			}
+		service := "enabled"
+		if p.Disabled {
+			service = "disabled"
 		}
 		items = append(items, item{entry.Name(), p.Node.Name, p.Role, p.VirtualNetwork, p.Segment, auth, service, len(p.Mappings)})
 	}
@@ -98,7 +69,7 @@ func listNodes() error {
 		fmt.Println("no local nodes")
 		return nil
 	}
-	fmt.Println("INSTANCE\tNAME\tROLE\tNETWORK\tSEGMENT\tAUTH\tSERVICE\tMAPPINGS")
+	fmt.Println("INSTANCE\tNAME\tROLE\tNETWORK\tSEGMENT\tAUTH\tSTATE\tMAPPINGS")
 	for _, item := range items {
 		fmt.Printf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n", item.instance, item.name, item.role, item.network, item.segment, item.auth, item.service, item.mappings)
 	}

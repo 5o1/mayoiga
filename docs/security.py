@@ -7,9 +7,12 @@ def security():
     Keep `profile.json` and generated `.key` files private. Published-service
     UUIDs and certificate pins are shared by the coordinator only with
     authorized members of the same virtual network. Bind pull listeners to
-    `127.0.0.1` on shared machines. Publishers
-    should expose only their chosen encrypted listener; targets remain
-    reachable solely from the publisher.
+    `127.0.0.1` on shared machines. A publisher does not need a public
+    listener or fixed address; its local target remains reachable solely from
+    the publisher, which opens a reverse stream to a relay when requested.
+    Private-LAN direct candidates are generated at runtime, signed into
+    heartbeats, leased by the coordinator, and never distributed across
+    logical segments.
 
     TLS 1.3 protects every hop and certificate pinning prevents silent
     interception with an unrelated certificate. VLESS supplies authentication,
@@ -41,12 +44,14 @@ def security():
     bytes are sent.
 
     A subnode's pre-enrollment relay tunnel is not yet node-signed, because no
-    approved credential exists. It is restricted to the relay's configured
-    coordinator and remains protected by both the pinned outer relay TLS
-    connection and the independently pinned inner coordinator TLS connection.
-    After approval, discovery and service requests retain the node's normal
-    Ed25519 signatures. Possession of a relay pin does not grant coordinator
-    approval.
+    approved credential exists. It therefore proves possession of the relay's
+    separately generated admission token. The relay accepts only a bounded
+    number of these tunnels and forwards them only to its configured
+    coordinator. The tunnel remains protected by both the pinned outer relay
+    TLS connection and the independently pinned inner coordinator TLS
+    connection. After approval, discovery and service requests retain the
+    node's normal Ed25519 signatures. Possession of a relay pin or token does
+    not grant coordinator approval.
 
     Connection requests are signed, rate-limited, bounded globally and per
     target, and limited to an active target's registered service in the same

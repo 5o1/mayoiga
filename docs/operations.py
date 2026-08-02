@@ -31,7 +31,7 @@ def operations():
 
     ```bash
     ./mayoiga --instance home --action add --kind publish --name nas \
-      --listen 0.0.0.0:28443 --endpoint home.example:28443 \
+      --listen 0.0.0.0:28443 \
       --target 192.168.1.20:5000
     ```
 
@@ -40,26 +40,40 @@ def operations():
     --service nas`; no credentials are copied manually. A relay is configured
     at node creation and serves registered services in its own segment.
     A subnode additionally names one registered same-segment relay as its
-    fixed control- and data-plane gateway.
+    fixed control- and data-plane gateway. Relay creation prints a
+    `SUBNODE_RELAY_TOKEN` once; keep it private and pass it to every allowed
+    subnode with `--upstream-relay-token`.
+    Rotate a leaked token with `configure-node --rotate-relay-token`, then
+    update every affected subnode before restarting it.
 
     Profiles live in `~/.config/mayoiga/nodes/<instance>/profile.json`. Use
     `--action list-nodes`, or target a node with `--instance NAME --action
     configure-node|status|start|stop|delete-node`; deletion also requires
-    `--yes`. Linux can create the rootless template
-    `~/.config/systemd/user/mayoiga@.service`, with one service per instance.
-    For unattended multi-node hosts, use `--action service-install` followed
-    by `--action service-start`. Containers run `--action service-run` as
-    their foreground command. A bind-mounted data directory is selected with
-    `--manager-dir /data/mayoiga`; it must contain `nodes/`. The manager scans
-    `nodes/` every five seconds:
-    it starts added nodes, restarts changed nodes, stops deleted nodes, and
-    restarts failures with exponential backoff capped at 30 seconds. It does
+    `--yes`. There is one rootless supervisor for all standard profiles:
+    Linux `--action service-install` creates
+    `~/.config/systemd/user/mayoiga.service`, then `--action service-start`
+    starts every enabled node. `--action start` enables one node and starts
+    that manager; `--action stop` disables one node. Do not run a separate
+    per-instance systemd unit. Containers and Windows run `--action
+    service-run` as their foreground command. A bind-mounted data directory is
+    selected with `--manager-dir /data/mayoiga`; it must contain `nodes/`.
+    The manager scans every five seconds. It starts added/enabled nodes, stops
+    disabled/deleted nodes, and fully restarts a changed profile only after its
+    old process exits. It performs static validation first and retains the
+    last valid worker if a changed profile is invalid. Existing TCP sessions
+    end during a successful configuration restart. Failed node processes are
+    retried with exponential backoff capped at 30 seconds. The manager does
     not manage Docker restart policy, SSH, DDNS, or published applications.
-    Windows currently uses `--action service-run`; OS service installation is
-    not yet available. No legacy migration exists.
-    Coordinator URLs and all endpoints require explicit `host:port` values
-    with numeric ports from 1 to 65535; port zero is invalid. Creation checks
-    live port occupancy and declarations in other local node profiles,
+    No legacy profile migration exists.
+    Coordinator and relay listener addresses require explicit `host:port`
+    values with numeric ports from 1 to 65535; port zero is invalid. A
+    published service does not accept an external endpoint or advertised node
+    address. On every heartbeat, mayoiga derives private-LAN candidates from
+    the publish listener and active local interfaces. The coordinator grants
+    each candidate a 90-second lease and distributes it only inside that
+    segment. Use `0.0.0.0:PORT` for a publish listener when same-LAN direct
+    access is wanted; use a loopback listener to require relay access. Creation
+    checks live port occupancy and declarations in other local node profiles,
     including stopped nodes, before saving.
 
     The coordinator's connection queue is configured explicitly with
@@ -72,10 +86,16 @@ def operations():
     Delivery is at least once: the client writes `connection-inbox.json`
     before ACK, and an unhandled offer is redelivered after its lease.
     `status` exposes heartbeat, discovery, and inbox errors independently.
+    Coordinator failures use a JSON response with a stable `code` and safe
+    human-readable `message`; the CLI displays the code and localizes known
+    failures. Relay failures use the same stable code in their TLS handshake
+    response. Use `--reason TEXT` with `reject`, `reject-connection`, or
+    `cancel-connection` to persist an explanation for the other node.
     A pull hosted by a relay automatically uses an on-demand reverse
-    connection after ordinary relay/direct paths fail. The target must keep
-    its node process and inbox worker running, but no permanent data tunnel or
-    inbound target port is required.
+    connection when no current coordinator candidate is usable. The publisher
+    initiates the encrypted data stream to the relay; it must keep its node
+    process and inbox worker running, but no permanent data tunnel, fixed
+    publisher endpoint, or inbound target port is required.
 
     `.github/workflows/release.yml` builds Linux and Windows amd64 archives.
     """

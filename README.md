@@ -52,7 +52,7 @@ mayoiga --instance home-relay --role relay --network family --segment home \
   --coordinator https://home.example:18443 --coordinator-pin <PIN> \
   --action add-node
 mayoiga --instance home-relay --action add --kind publish --name nas \
-  --listen 127.0.0.1:28443 --endpoint 127.0.0.1:28443 \
+  --listen 0.0.0.0:28443 \
   --target 192.168.1.20:5000
 mayoiga --instance home-relay --action start
 ```
@@ -64,9 +64,17 @@ mayoiga --instance offline-node --role subnode --network family --segment home \
   --upstream-relay-node <RELAY_NODE_ID> \
   --upstream-relay-endpoint 192.168.1.10:29443 \
   --upstream-relay-pin <RELAY_PIN> \
+  --upstream-relay-token <SUBNODE_RELAY_TOKEN> \
   --coordinator https://home.example:18443 --coordinator-pin <PIN> \
   --action add-node
 ```
+
+When a relay is created, it prints `SUBNODE_RELAY_TOKEN` once. Store it as a
+secret and provide it only to subnodes that may use that relay for coordinator
+access. An existing relay receives its first token when you run `configure-node`.
+To revoke the previous token, run `mayoiga --instance home-relay --action
+configure-node --rotate-relay-token`; update every permitted subnode with the
+new token.
 
 ## Licenses
 

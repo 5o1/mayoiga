@@ -155,7 +155,7 @@ func TestEnrollmentSigningDiscoveryAndHistory(t *testing.T) {
 	rec = call(http.MethodPost, "/v1/enroll/request", discoveryRequest{Node: rejected, PublicKey: publicKey()}, false)
 	var rejectedState enrollmentState
 	_ = json.Unmarshal(rec.Body.Bytes(), &rejectedState)
-	rec = call(http.MethodPost, "/v1/admin/reject", approveRequest{DeviceCode: rejectedState.DeviceCode}, true)
+	rec = call(http.MethodPost, "/v1/admin/reject", approveRequest{DeviceCode: rejectedState.DeviceCode, Reason: "owner declined this device"}, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("reject status=%d", rec.Code)
 	}
@@ -165,11 +165,17 @@ func TestEnrollmentSigningDiscoveryAndHistory(t *testing.T) {
 	if rejectedPoll.Status != "rejected" {
 		t.Fatalf("poll status=%q", rejectedPoll.Status)
 	}
+	if rejectedPoll.Reason != "owner declined this device" {
+		t.Fatalf("poll reason=%q", rejectedPoll.Reason)
+	}
 	rec = call(http.MethodGet, "/v1/admin/handshakes?status=403", nil, true)
 	var rejectedHistory []handshakeHistory
 	_ = json.Unmarshal(rec.Body.Bytes(), &rejectedHistory)
 	if len(rejectedHistory) != 1 {
 		t.Fatalf("rejected history=%+v", rejectedHistory)
+	}
+	if rejectedHistory[0].Reason != "owner declined this device" {
+		t.Fatalf("history reason=%q", rejectedHistory[0].Reason)
 	}
 
 	rec = call(http.MethodPost, "/v1/enroll/request", discoveryRequest{Node: discoveredNode{ID: "x", Name: "other", VirtualNetwork: "mesh-b"}}, false)
@@ -285,7 +291,7 @@ func TestCoordinatorPublishesVerifiedNodeCapabilities(t *testing.T) {
 		ID: "relay", Name: "relay", Role: "relay", Segment: "home", VirtualNetwork: "mesh",
 		IdentityKey: "spoofed",
 		Services: []publishedService{{
-			NodeID: "spoofed", Name: "nas", Segment: "spoofed", Endpoint: "relay.test:18443",
+			NodeID: "spoofed", Name: "nas", Segment: "spoofed",
 			UUID: "uuid", PinnedSHA256: strings.Repeat("a", 64),
 		}},
 		Relay: &relayAdvertisement{
@@ -312,6 +318,112 @@ func TestCoordinatorPublishesVerifiedNodeCapabilities(t *testing.T) {
 	}
 	if stored.Relay == nil || stored.Relay.Priority != 10 {
 		t.Fatalf("relay capability missing: %+v", stored.Relay)
+	}
+}
+
+func TestCoordinatorLeasesAndScopesDirectCandidates(t *testing.T) {
+	r, err := newRegistry(filepath.Join(t.TempDir(), "state.json"), "secret", "mesh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisherCredential := testNodeCredential(t)
+	sameSegmentCredential := testNodeCredential(t)
+	crossSegmentCredential := testNodeCredential(t)
+	r.mu.Lock()
+	r.state.Authorized["publisher"] = authorizedNode{PublicKey: publisherCredential.PublicKey}
+	r.state.Authorized["same"] = authorizedNode{PublicKey: sameSegmentCredential.PublicKey}
+	r.state.Authorized["cross"] = authorizedNode{PublicKey: crossSegmentCredential.PublicKey}
+	r.state.Nodes["same"] = discoveredNode{ID: "same", Name: "same", Role: "client", Segment: "school", VirtualNetwork: "mesh", LastSeen: time.Now().UTC()}
+	r.state.Nodes["cross"] = discoveredNode{ID: "cross", Name: "cross", Role: "client", Segment: "home", VirtualNetwork: "mesh", LastSeen: time.Now().UTC()}
+	r.mu.Unlock()
+
+	publisher := discoveredNode{
+		ID: "publisher", Name: "publisher", Role: "client", Segment: "school", VirtualNetwork: "mesh",
+		Services: []publishedService{{
+			Name: "nas", UUID: "uuid", PinnedSHA256: strings.Repeat("a", 64),
+			DirectCandidates: []directCandidate{{Address: "192.168.50.7:28443", ExpiresAt: time.Now().Add(24 * time.Hour)}},
+		}},
+	}
+	body, _ := json.Marshal(discoveryRequest{Node: publisher})
+	request := httptest.NewRequest(http.MethodPost, "/v1/nodes/register", bytes.NewReader(body))
+	if err := signRequest(request, body, "publisher", publisherCredential.PrivateKey); err != nil {
+		t.Fatal(err)
+	}
+	registered := httptest.NewRecorder()
+	r.ServeHTTP(registered, request)
+	if registered.Code != http.StatusOK {
+		t.Fatalf("register status=%d body=%s", registered.Code, registered.Body)
+	}
+
+	r.mu.Lock()
+	stored := r.state.Nodes["publisher"].Services[0].DirectCandidates
+	r.mu.Unlock()
+	if len(stored) != 1 || stored[0].Address != "192.168.50.7:28443" || stored[0].ExpiresAt.Before(time.Now().Add(60*time.Second)) || stored[0].ExpiresAt.After(time.Now().Add(2*directCandidateLease)) {
+		t.Fatalf("coordinator did not assign candidate lease: %+v", stored)
+	}
+
+	discover := func(nodeID string, credential nodeCredential) []discoveredNode {
+		input, _ := json.Marshal(discoverySyncRequest{})
+		request := httptest.NewRequest(http.MethodPost, "/v1/nodes/discovery", bytes.NewReader(input))
+		if err := signRequest(request, input, nodeID, credential.PrivateKey); err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		r.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s discovery status=%d body=%s", nodeID, response.Code, response.Body)
+		}
+		var output discoveryResponse
+		if err := json.NewDecoder(response.Body).Decode(&output); err != nil {
+			t.Fatal(err)
+		}
+		return output.Nodes
+	}
+	findPublisher := func(nodes []discoveredNode) publishedService {
+		for _, node := range nodes {
+			if node.ID == "publisher" {
+				return node.Services[0]
+			}
+		}
+		t.Fatal("publisher missing from discovery")
+		return publishedService{}
+	}
+	if got := findPublisher(discover("same", sameSegmentCredential)).DirectCandidates; len(got) != 1 || got[0].Address != "192.168.50.7:28443" {
+		t.Fatalf("same segment did not receive managed candidate: %+v", got)
+	}
+	if got := findPublisher(discover("cross", crossSegmentCredential)).DirectCandidates; len(got) != 0 {
+		t.Fatalf("cross segment received LAN candidate: %+v", got)
+	}
+
+	r.mu.Lock()
+	node := r.state.Nodes["publisher"]
+	node.Services[0].DirectCandidates[0].ExpiresAt = time.Now().Add(-time.Second)
+	r.state.Nodes["publisher"] = node
+	r.cleanupLocked(time.Now().UTC())
+	got := r.state.Nodes["publisher"].Services[0].DirectCandidates
+	r.mu.Unlock()
+	if len(got) != 0 {
+		t.Fatalf("expired candidate was retained: %+v", got)
+	}
+}
+
+func TestLocalDirectCandidatesAreDerivedAtRuntime(t *testing.T) {
+	previous := interfaceAddrs
+	defer func() { interfaceAddrs = previous }()
+	interfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{IP: net.ParseIP("192.168.8.9")},
+			&net.IPNet{IP: net.ParseIP("10.8.0.2")},
+			&net.IPNet{IP: net.ParseIP("127.0.0.1")},
+			&net.IPNet{IP: net.ParseIP("203.0.113.8")},
+		}, nil
+	}
+	got := localDirectCandidates("0.0.0.0:28443")
+	if len(got) != 2 || got[0].Address != "10.8.0.2:28443" || got[1].Address != "192.168.8.9:28443" {
+		t.Fatalf("runtime candidates=%+v", got)
+	}
+	if !got[0].ExpiresAt.IsZero() {
+		t.Fatalf("node assigned its own candidate lease: %+v", got[0])
 	}
 }
 

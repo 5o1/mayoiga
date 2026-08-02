@@ -24,6 +24,7 @@ const (
 	maxConnectionRequests     = 10000
 	maxConnectionsPerTarget   = 128
 	maxInboxEvents            = 32
+	maxConnectionReason       = 512
 )
 
 type connectionRequest struct {
@@ -354,6 +355,10 @@ func (r *registry) decideConnection(w http.ResponseWriter, req *http.Request, st
 		http.Error(w, "request_id is required", http.StatusBadRequest)
 		return
 	}
+	if len(strings.TrimSpace(input.Reason)) > maxConnectionReason {
+		http.Error(w, "connection reason is too long", http.StatusBadRequest)
+		return
+	}
 	now := time.Now().UTC()
 	r.mu.Lock()
 	if r.cleanupLocked(now) {
@@ -406,6 +411,10 @@ func (r *registry) cancelConnection(w http.ResponseWriter, req *http.Request) {
 	var input connectionIDInput
 	if json.Unmarshal(body, &input) != nil || input.RequestID == "" {
 		http.Error(w, "request_id is required", http.StatusBadRequest)
+		return
+	}
+	if len(strings.TrimSpace(input.Reason)) > maxConnectionReason {
+		http.Error(w, "connection reason is too long", http.StatusBadRequest)
 		return
 	}
 	now := time.Now().UTC()
@@ -655,7 +664,7 @@ func waitInbox(ctx context.Context, path string, p profile) (inboxWaitResponse, 
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return inboxWaitResponse{}, fmt.Errorf("coordinator returned %s", response.Status)
+		return inboxWaitResponse{}, coordinatorResponseError(response)
 	}
 	var output inboxWaitResponse
 	if err := json.NewDecoder(response.Body).Decode(&output); err != nil {
@@ -669,10 +678,12 @@ func waitInbox(ctx context.Context, path string, p profile) (inboxWaitResponse, 
 		if err != nil {
 			return output, err
 		}
-		ack.Body.Close()
 		if ack.StatusCode != http.StatusOK {
-			return output, fmt.Errorf("coordinator inbox ack returned %s", ack.Status)
+			err := coordinatorResponseError(ack)
+			ack.Body.Close()
+			return output, err
 		}
+		ack.Body.Close()
 	} else if err := saveInbox(path, cachedInbox{Cursor: output.Cursor}); err != nil {
 		return output, err
 	}
@@ -889,7 +900,7 @@ func dispatchAutomaticConnectionOffers(ctx context.Context, profilePath string, 
 }
 
 func serveAutomaticConnectionOffer(ctx context.Context, profilePath string, p profile, event connectionRequest) error {
-	service, exists := localPublishedService(p, event.Service)
+	target, exists := localPublishedTarget(p, event.Service)
 	if !exists {
 		_, _ = decideConnectionRequest(ctx, p, event.ID, "reject", "published service is not local")
 		return fmt.Errorf("service %q is not published locally", event.Service)
@@ -908,31 +919,42 @@ func serveAutomaticConnectionOffer(ctx context.Context, profilePath string, p pr
 	if relay.ID == "" {
 		return fmt.Errorf("return relay %q is not discovered", event.ReturnRelay)
 	}
-	cache := newConnectorCache()
-	local, err := cache.dial(service)
+	// The reverse connection is already mutually authenticated and encrypted by
+	// dialReverseRelay.  Re-entering the local VLESS listener here used to add a
+	// second TLS handshake and a short-lived embedded Xray instance for every
+	// connection.  The receiving node owns this mapping, so it can safely dial
+	// the configured local target directly.
+	local, err := net.DialTimeout("tcp", target, relayDialTimeout)
 	if err != nil {
-		cache.Close()
-		return fmt.Errorf("connect local publish: %w", err)
+		_, _ = decideConnectionRequest(ctx, p, event.ID, "reject", "local published target is unavailable")
+		return fmt.Errorf("connect local published target %q: %w", target, err)
 	}
 	reverse, err := dialReverseRelay(p, relay, event.IdempotencyKey, event.Service)
 	if err != nil {
 		local.Close()
-		cache.Close()
+		_, _ = decideConnectionRequest(ctx, p, event.ID, "reject", "return relay is unavailable")
 		return fmt.Errorf("connect return relay: %w", err)
 	}
 	if _, err := decideConnectionRequest(ctx, p, event.ID, "accept", ""); err != nil {
 		reverse.Close()
 		local.Close()
-		cache.Close()
 		return err
 	}
 	_ = removeInboxRequest(profilePath, event.ID)
 	go func() {
-		defer cache.Close()
 		defer local.Close()
 		bridge(reverse, local)
 	}()
 	return nil
+}
+
+func localPublishedTarget(p profile, name string) (string, bool) {
+	for _, mapping := range p.Mappings {
+		if mapping.Kind == "publish" && mapping.Name == name && validateHostPort(mapping.Target) == nil {
+			return mapping.Target, true
+		}
+	}
+	return "", false
 }
 
 func localPublishedService(p profile, name string) (publishedService, bool) {
@@ -943,7 +965,7 @@ func localPublishedService(p profile, name string) (publishedService, bool) {
 		}
 		for _, mapping := range p.Mappings {
 			if mapping.Kind == "publish" && mapping.Name == name {
-				service.Endpoint = loopbackEndpoint(mapping.Listen)
+				service.DirectCandidates = []directCandidate{{Address: loopbackEndpoint(mapping.Listen)}}
 				return service, true
 			}
 		}
@@ -1009,8 +1031,7 @@ func createConnectionRequest(ctx context.Context, p profile, targetNode, service
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return connectionRequest{}, fmt.Errorf("coordinator returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return connectionRequest{}, coordinatorResponseError(response)
 	}
 	var connection connectionRequest
 	return connection, json.NewDecoder(response.Body).Decode(&connection)
@@ -1025,8 +1046,7 @@ func decideConnectionRequest(ctx context.Context, p profile, requestID, decision
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return connectionRequest{}, fmt.Errorf("coordinator returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return connectionRequest{}, coordinatorResponseError(response)
 	}
 	var connection connectionRequest
 	return connection, json.NewDecoder(response.Body).Decode(&connection)
@@ -1067,14 +1087,13 @@ func getConnectionStatus(ctx context.Context, p profile, requestID, knownState s
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return connectionRequest{}, fmt.Errorf("coordinator returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return connectionRequest{}, coordinatorResponseError(response)
 	}
 	var connection connectionRequest
 	return connection, json.NewDecoder(response.Body).Decode(&connection)
 }
 
-func decideConnectionCLI(profilePath, requestID, decision string) error {
+func decideConnectionCLI(profilePath, requestID, decision, reason string) error {
 	if requestID == "" {
 		return errors.New("--request-id is required")
 	}
@@ -1082,7 +1101,7 @@ func decideConnectionCLI(profilePath, requestID, decision string) error {
 	if err != nil {
 		return err
 	}
-	connection, err := decideConnectionRequest(context.Background(), p, requestID, decision, "")
+	connection, err := decideConnectionRequest(context.Background(), p, requestID, decision, reason)
 	if err != nil {
 		return err
 	}

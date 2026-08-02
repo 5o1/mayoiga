@@ -35,14 +35,19 @@ const (
 	deviceCodeAttempts      = 32
 	publicRequestsPerMinute = 120
 	adminRequestsPerMinute  = 120
+	directCandidateLease    = 90 * time.Second
+	maxDirectCandidates     = 16
+	maxEnrollmentReason     = 512
 )
 
-var secureRandomReader io.Reader = rand.Reader
+var (
+	secureRandomReader = io.Reader(rand.Reader)
+	interfaceAddrs     = net.InterfaceAddrs
+)
 
 type nodeConfig struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	Endpoints []string `json:"endpoints,omitempty"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 type nodeCredential struct {
@@ -85,7 +90,6 @@ type discoveredNode struct {
 	Role           string              `json:"role"`
 	Segment        string              `json:"segment"`
 	VirtualNetwork string              `json:"virtual_network"`
-	Endpoints      []string            `json:"endpoints,omitempty"`
 	IdentityKey    string              `json:"identity_key,omitempty"`
 	Services       []publishedService  `json:"services,omitempty"`
 	Relay          *relayAdvertisement `json:"relay,omitempty"`
@@ -94,12 +98,20 @@ type discoveredNode struct {
 }
 
 type publishedService struct {
-	NodeID       string `json:"node_id"`
-	Name         string `json:"name"`
-	Segment      string `json:"segment"`
-	Endpoint     string `json:"endpoint"`
-	UUID         string `json:"uuid"`
-	PinnedSHA256 string `json:"pinned_sha256"`
+	NodeID           string            `json:"node_id"`
+	Name             string            `json:"name"`
+	Segment          string            `json:"segment"`
+	DirectCandidates []directCandidate `json:"direct_candidates,omitempty"`
+	UUID             string            `json:"uuid"`
+	PinnedSHA256     string            `json:"pinned_sha256"`
+}
+
+// directCandidate is generated at runtime from a publisher's local network
+// interfaces.  The coordinator assigns and renews ExpiresAt; it is never read
+// from a profile and is distributed only to peers in the same segment.
+type directCandidate struct {
+	Address   string    `json:"address"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 type relayAdvertisement struct {
@@ -149,6 +161,7 @@ type handshakeHistory struct {
 	DeviceCode string         `json:"device_code"`
 	Node       discoveredNode `json:"node"`
 	StatusCode int            `json:"status_code"`
+	Reason     string         `json:"reason,omitempty"`
 	CreatedAt  time.Time      `json:"created_at"`
 	ExpiresAt  time.Time      `json:"expires_at"`
 	HandledAt  time.Time      `json:"handled_at,omitempty"`
@@ -250,6 +263,10 @@ func newRegistry(path, adminToken, network string) (*registry, error) {
 }
 
 func (r *registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	r.serveStructured(w, req, r.servePublic)
+}
+
+func (r *registry) servePublic(w http.ResponseWriter, req *http.Request) {
 	if strings.HasPrefix(req.URL.Path, "/v1/connections/") {
 		if r.serveConnections(w, req) {
 			return
@@ -284,6 +301,10 @@ func (r *registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *registry) serveAdmin(w http.ResponseWriter, req *http.Request) {
+	r.serveStructured(w, req, r.serveAdminRequest)
+}
+
+func (r *registry) serveAdminRequest(w http.ResponseWriter, req *http.Request) {
 	if !isLoopbackRequest(req) {
 		http.Error(w, "admin API is local only", http.StatusForbidden)
 		return
@@ -356,6 +377,123 @@ func decodeJSON(w http.ResponseWriter, req *http.Request, target any) bool {
 		return false
 	}
 	return true
+}
+
+type apiErrorResponse struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// structuredResponseWriter turns every coordinator error, including legacy
+// http.Error calls, into a stable JSON envelope. Success responses are passed
+// through byte-for-byte so long polls and existing clients remain compatible.
+type structuredResponseWriter struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+func (w *structuredResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *structuredResponseWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(body)
+}
+
+func (r *registry) serveStructured(w http.ResponseWriter, req *http.Request, next func(http.ResponseWriter, *http.Request)) {
+	captured := &structuredResponseWriter{ResponseWriter: w}
+	next(captured, req)
+	status := captured.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	if status >= http.StatusBadRequest {
+		message := strings.TrimSpace(captured.body.String())
+		if message == "" {
+			message = http.StatusText(status)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(apiErrorResponse{Code: apiErrorCode(status, message), Message: message})
+		return
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(captured.body.Bytes())
+}
+
+func apiErrorCode(status int, message string) string {
+	known := map[string]string{
+		"invalid body":                                                    "request_body_invalid",
+		"invalid JSON":                                                    "request_json_invalid",
+		"invalid JSON or node id":                                         "node_identity_invalid",
+		"invalid node signature":                                          "node_signature_invalid",
+		"node rate limit exceeded":                                        "node_rate_limited",
+		"rate limit exceeded":                                             "request_rate_limited",
+		"node must heartbeat before discovery":                            "node_not_active",
+		"source or target node is not active":                             "connection_node_inactive",
+		"target service is not published":                                 "published_service_missing",
+		"return relay is not active in the source segment":                "return_relay_invalid",
+		"connection request capacity reached":                             "connection_capacity_reached",
+		"target connection queue is full":                                 "connection_target_queue_full",
+		"an inbox wait is already active for this node":                   "inbox_wait_already_active",
+		"cursor is ahead of server state":                                 "inbox_cursor_invalid",
+		"connection request not found":                                    "connection_request_missing",
+		"only the target node can decide this request":                    "connection_decision_forbidden",
+		"only the source node can cancel this request":                    "connection_cancel_forbidden",
+		"connection request cannot be decided in its current state":       "connection_state_terminal",
+		"connection request is already terminal":                          "connection_state_terminal",
+		"connection reason is too long":                                   "connection_reason_too_long",
+		"enrollment reason is too long":                                   "enrollment_reason_too_long",
+		"connection request is not visible to this node":                  "connection_request_hidden",
+		"handshake not found or expired":                                  "enrollment_missing_or_expired",
+		"unexpired handshake not found":                                   "enrollment_missing_or_expired",
+		"handshake was rejected":                                          "enrollment_rejected",
+		"handshake was already approved":                                  "enrollment_already_approved",
+		"node id is already authorized; explicit replacement is required": "node_credential_conflict",
+		"unauthorized":                                                    "admin_authentication_failed",
+	}
+	if code := known[message]; code != "" {
+		return code
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		return "authentication_failed"
+	case http.StatusForbidden:
+		return "access_denied"
+	case http.StatusNotFound:
+		return "resource_not_found"
+	case http.StatusConflict:
+		return "request_conflict"
+	case http.StatusTooManyRequests:
+		return "request_rate_limited"
+	case http.StatusServiceUnavailable:
+		return "service_unavailable"
+	default:
+		return "request_failed"
+	}
+}
+
+func coordinatorResponseError(response *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+	var remote apiErrorResponse
+	if json.Unmarshal(body, &remote) == nil && remote.Code != "" {
+		message := strings.TrimSpace(remote.Message)
+		if message == "" {
+			message = http.StatusText(response.StatusCode)
+		}
+		return fmt.Errorf("coordinator %s: %s", remote.Code, localizedError(remote.Code, message))
+	}
+	message := strings.TrimSpace(string(body))
+	if message == "" {
+		message = response.Status
+	}
+	return fmt.Errorf("coordinator request failed: %s", message)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -492,6 +630,7 @@ type pollRequest struct {
 type pollResponse struct {
 	Status    string    `json:"status"`
 	ExpiresAt time.Time `json:"expires_at"`
+	Reason    string    `json:"reason,omitempty"`
 }
 
 func (r *registry) pollEnrollment(w http.ResponseWriter, req *http.Request) {
@@ -515,7 +654,8 @@ func (r *registry) pollEnrollment(w http.ResponseWriter, req *http.Request) {
 	if pending.Rejected {
 		status = "rejected"
 	}
-	writeJSON(w, http.StatusOK, pollResponse{Status: status, ExpiresAt: pending.ExpiresAt})
+	history := r.state.History[input.RequestID]
+	writeJSON(w, http.StatusOK, pollResponse{Status: status, ExpiresAt: pending.ExpiresAt, Reason: history.Reason})
 }
 
 func (r *registry) adminAuthorized(req *http.Request) bool {
@@ -561,6 +701,7 @@ func (r *registry) listAudit(w http.ResponseWriter, req *http.Request) {
 type approveRequest struct {
 	DeviceCode string `json:"device_code"`
 	Replace    bool   `json:"replace,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 func (r *registry) approveHandshake(w http.ResponseWriter, req *http.Request) {
@@ -629,6 +770,10 @@ func (r *registry) rejectHandshake(w http.ResponseWriter, req *http.Request) {
 	if !decodeJSON(w, req, &input) {
 		return
 	}
+	if len(strings.TrimSpace(input.Reason)) > maxEnrollmentReason {
+		http.Error(w, "enrollment reason is too long", http.StatusBadRequest)
+		return
+	}
 	code := normalizeDeviceCode(input.DeviceCode)
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -653,6 +798,7 @@ func (r *registry) rejectHandshake(w http.ResponseWriter, req *http.Request) {
 	r.state.Pending[requestID] = pending
 	history := r.state.History[requestID]
 	history.StatusCode = 403
+	history.Reason = strings.TrimSpace(input.Reason)
 	history.HandledAt = time.Now().UTC()
 	r.state.History[requestID] = history
 	r.appendAuditLocked(auditEvent{
@@ -756,15 +902,17 @@ func (r *registry) updateNode(w http.ResponseWriter, req *http.Request) (discove
 		return discoveredNode{}, nil, 0, false
 	}
 	n.IdentityKey = authorized.PublicKey
+	now := time.Now().UTC()
 	for i := range n.Services {
 		service := &n.Services[i]
 		service.NodeID, service.Segment = n.ID, n.Segment
-		if service.Name == "" || service.UUID == "" ||
-			validateHostPort(service.Endpoint) != nil || !validSHA256Pin(service.PinnedSHA256) {
+		candidates, candidateErr := managedDirectCandidates(service.DirectCandidates, now.Add(directCandidateLease))
+		if service.Name == "" || service.UUID == "" || candidateErr != nil || !validSHA256Pin(service.PinnedSHA256) {
 			r.mu.Unlock()
 			http.Error(w, "invalid published service", http.StatusBadRequest)
 			return discoveredNode{}, nil, 0, false
 		}
+		service.DirectCandidates = candidates
 	}
 	if n.Role == "relay" {
 		if n.Relay == nil || validateHostPort(n.Relay.Endpoint) != nil || !validSHA256Pin(n.Relay.PinnedSHA256) || n.Relay.Priority < 0 {
@@ -791,11 +939,10 @@ func (r *registry) updateNode(w http.ResponseWriter, req *http.Request) (discove
 	} else {
 		n.UpstreamRelay = ""
 	}
-	now := time.Now().UTC()
 	old, existed := r.state.Nodes[n.ID]
 	n.LastSeen = now
 	r.state.Nodes[n.ID] = n
-	if !existed || !sameNodeTopology(old, n) {
+	if !existed || !sameNodeTopology(old, n) || directCandidateRenewalDue(old, now) {
 		r.state.Revision++
 	}
 	for id, pending := range r.state.Pending {
@@ -815,7 +962,7 @@ func (r *registry) updateNode(w http.ResponseWriter, req *http.Request) (discove
 	nodes := make([]discoveredNode, 0)
 	for _, candidate := range r.state.Nodes {
 		if candidate.VirtualNetwork == n.VirtualNetwork && candidate.ID != n.ID {
-			nodes = append(nodes, candidate)
+			nodes = append(nodes, nodeForDiscovery(n, candidate))
 		}
 	}
 	persistErr := r.persistLocked()
@@ -830,10 +977,88 @@ func (r *registry) updateNode(w http.ResponseWriter, req *http.Request) (discove
 }
 
 func sameNodeTopology(left, right discoveredNode) bool {
-	left.LastSeen, right.LastSeen = time.Time{}, time.Time{}
+	left, right = topologyWithoutLeases(left), topologyWithoutLeases(right)
 	leftBody, _ := json.Marshal(left)
 	rightBody, _ := json.Marshal(right)
 	return bytes.Equal(leftBody, rightBody)
+}
+
+// Direct-candidate lease expiry is coordinator-managed liveness metadata, not
+// topology. Heartbeats renew it frequently; comparing its exact value here
+// would force a discovery revision and full peer rewrite on every heartbeat.
+func topologyWithoutLeases(node discoveredNode) discoveredNode {
+	node.LastSeen = time.Time{}
+	node.Services = append([]publishedService(nil), node.Services...)
+	for serviceIndex := range node.Services {
+		candidates := append([]directCandidate(nil), node.Services[serviceIndex].DirectCandidates...)
+		for candidateIndex := range candidates {
+			candidates[candidateIndex].ExpiresAt = time.Time{}
+		}
+		node.Services[serviceIndex].DirectCandidates = candidates
+	}
+	return node
+}
+
+// Peers must learn a renewed lease before their cached direct candidate
+// expires. Refresh only in the latter half of the 90-second lease instead of
+// on every 30-second heartbeat.
+func directCandidateRenewalDue(node discoveredNode, now time.Time) bool {
+	refreshAt := now.Add(directCandidateLease / 2)
+	for _, service := range node.Services {
+		for _, candidate := range service.DirectCandidates {
+			if !candidate.ExpiresAt.IsZero() && !candidate.ExpiresAt.After(refreshAt) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func managedDirectCandidates(input []directCandidate, expiry time.Time) ([]directCandidate, error) {
+	if len(input) > maxDirectCandidates {
+		return nil, fmt.Errorf("too many direct candidates")
+	}
+	seen := make(map[string]struct{}, len(input))
+	output := make([]directCandidate, 0, len(input))
+	for _, candidate := range input {
+		if err := validateDirectCandidate(candidate.Address); err != nil {
+			return nil, err
+		}
+		if _, exists := seen[candidate.Address]; exists {
+			continue
+		}
+		seen[candidate.Address] = struct{}{}
+		output = append(output, directCandidate{Address: candidate.Address, ExpiresAt: expiry})
+	}
+	sort.Slice(output, func(i, j int) bool { return output[i].Address < output[j].Address })
+	return output, nil
+}
+
+func validateDirectCandidate(address string) error {
+	if err := validateHostPort(address); err != nil {
+		return err
+	}
+	host, _, _ := net.SplitHostPort(address)
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() {
+		return errors.New("direct candidate must use a private unicast IP address")
+	}
+	return nil
+}
+
+// nodeForDiscovery keeps direct candidates in the coordinator's state but
+// only releases them to peers in the same logical segment.  Cross-segment
+// access always resolves a relay path instead of learning LAN addresses.
+func nodeForDiscovery(requester, candidate discoveredNode) discoveredNode {
+	if requester.Segment == candidate.Segment {
+		return candidate
+	}
+	output := candidate
+	output.Services = append([]publishedService(nil), candidate.Services...)
+	for i := range output.Services {
+		output.Services[i].DirectCandidates = nil
+	}
+	return output
 }
 
 func (r *registry) discoverNodes(w http.ResponseWriter, req *http.Request) {
@@ -863,7 +1088,7 @@ func (r *registry) discoverNodes(w http.ResponseWriter, req *http.Request) {
 	nodes := make([]discoveredNode, 0, len(r.state.Nodes))
 	for _, candidate := range r.state.Nodes {
 		if candidate.VirtualNetwork == node.VirtualNetwork && candidate.ID != nodeID {
-			nodes = append(nodes, candidate)
+			nodes = append(nodes, nodeForDiscovery(node, candidate))
 		}
 	}
 	r.mu.Unlock()
@@ -928,6 +1153,26 @@ func (r *registry) cleanupLocked(now time.Time) bool {
 		if node.LastSeen.Before(now.Add(-2 * time.Minute)) {
 			changed = true
 			delete(r.state.Nodes, id)
+			r.state.Revision++
+			continue
+		}
+		candidatesChanged := false
+		for serviceIndex := range node.Services {
+			service := &node.Services[serviceIndex]
+			active := service.DirectCandidates[:0]
+			for _, candidate := range service.DirectCandidates {
+				if candidate.ExpiresAt.After(now) {
+					active = append(active, candidate)
+				}
+			}
+			if len(active) != len(service.DirectCandidates) {
+				service.DirectCandidates = active
+				candidatesChanged = true
+			}
+		}
+		if candidatesChanged {
+			changed = true
+			r.state.Nodes[id] = node
 			r.state.Revision++
 		}
 	}
@@ -1137,7 +1382,7 @@ func coordinatorNodeHTTPClient(p profile) (*http.Client, error) {
 	if p.Role == "subnode" {
 		transport := client.Transport.(*http.Transport)
 		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dialCoordinatorViaRelay(ctx, p.VirtualNetwork, p.Subnode)
+			return dialCoordinatorViaRelay(ctx, p.VirtualNetwork, p.Node.ID, p.Subnode)
 		}
 	}
 	return client, nil
@@ -1176,7 +1421,7 @@ func requestEnrollment(ctx context.Context, path string, p *profile) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("coordinator returned %s", resp.Status)
+		return coordinatorResponseError(resp)
 	}
 	var enrollment enrollmentState
 	if err := json.NewDecoder(resp.Body).Decode(&enrollment); err != nil {
@@ -1216,7 +1461,7 @@ func pollEnrollment(ctx context.Context, path string, p *profile) (bool, error) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("coordinator returned %s", resp.Status)
+		return false, coordinatorResponseError(resp)
 	}
 	var output pollResponse
 	if err := json.NewDecoder(resp.Body).Decode(&output); err != nil {
@@ -1225,7 +1470,11 @@ func pollEnrollment(ctx context.Context, path string, p *profile) (bool, error) 
 	if output.Status == "rejected" {
 		p.Coordinator.Enrollment.Status = "rejected"
 		_ = saveProfile(path, *p)
-		return false, errors.New("upstream coordinator rejected the handshake")
+		reason := strings.TrimSpace(output.Reason)
+		if reason == "" {
+			reason = localizedError("enrollment_rejected", "upstream coordinator rejected the handshake")
+		}
+		return false, fmt.Errorf("enrollment_rejected: %s", reason)
 	}
 	if output.Status != "approved" {
 		return false, nil
@@ -1265,7 +1514,7 @@ func sendHeartbeat(ctx context.Context, p profile) (uint64, error) {
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("coordinator returned %s", response.Status)
+		return 0, coordinatorResponseError(response)
 	}
 	var output heartbeatResponse
 	if err := json.NewDecoder(response.Body).Decode(&output); err != nil {
@@ -1281,7 +1530,7 @@ func fetchDiscovery(ctx context.Context, path string, p profile, afterRevision, 
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("coordinator returned %s", response.Status)
+		return nil, coordinatorResponseError(response)
 	}
 	var output discoveryResponse
 	if err := json.NewDecoder(response.Body).Decode(&output); err != nil {
@@ -1300,12 +1549,13 @@ func fetchDiscovery(ctx context.Context, path string, p profile, afterRevision, 
 }
 
 func localDiscoveredNode(p profile) discoveredNode {
-	n := discoveredNode{ID: p.Node.ID, Name: p.Node.Name, Role: p.Role, Segment: p.Segment, VirtualNetwork: p.VirtualNetwork, Endpoints: p.Node.Endpoints}
+	n := discoveredNode{ID: p.Node.ID, Name: p.Node.Name, Role: p.Role, Segment: p.Segment, VirtualNetwork: p.VirtualNetwork}
 	for _, m := range p.Mappings {
 		if m.Kind == "publish" {
 			n.Services = append(n.Services, publishedService{
-				NodeID: p.Node.ID, Name: m.Name, Segment: p.Segment, Endpoint: m.Endpoint,
-				UUID: m.UUID, PinnedSHA256: m.CertificateSHA256,
+				NodeID: p.Node.ID, Name: m.Name, Segment: p.Segment,
+				DirectCandidates: localDirectCandidates(m.Listen),
+				UUID:             m.UUID, PinnedSHA256: m.CertificateSHA256,
 			})
 		}
 	}
@@ -1316,6 +1566,53 @@ func localDiscoveredNode(p profile) discoveredNode {
 		n.UpstreamRelay = p.Subnode.RelayNodeID
 	}
 	return n
+}
+
+func localDirectCandidates(listen string) []directCandidate {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return nil
+	}
+	addresses := make([]string, 0, maxDirectCandidates)
+	add := func(ip net.IP) {
+		if ip == nil {
+			return
+		}
+		address := net.JoinHostPort(ip.String(), port)
+		if validateDirectCandidate(address) == nil {
+			addresses = append(addresses, address)
+		}
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		interfaceAddresses, err := interfaceAddrs()
+		if err != nil {
+			return nil
+		}
+		for _, interfaceAddress := range interfaceAddresses {
+			var ip net.IP
+			switch value := interfaceAddress.(type) {
+			case *net.IPNet:
+				ip = value.IP
+			case *net.IPAddr:
+				ip = value.IP
+			}
+			if ip != nil {
+				add(ip)
+			}
+		}
+	default:
+		add(net.ParseIP(host))
+	}
+	sort.Strings(addresses)
+	output := make([]directCandidate, 0, len(addresses))
+	for _, address := range addresses {
+		if len(output) == maxDirectCandidates || (len(output) > 0 && output[len(output)-1].Address == address) {
+			continue
+		}
+		output = append(output, directCandidate{Address: address})
+	}
+	return output
 }
 
 func signRequest(req *http.Request, body []byte, nodeID, privateText string) error {
@@ -1385,7 +1682,7 @@ func listPendingHandshakes(path string, statusCode int) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("coordinator returned %s", resp.Status)
+		return coordinatorResponseError(resp)
 	}
 	var items []handshakeHistory
 	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
@@ -1396,7 +1693,7 @@ func listPendingHandshakes(path string, statusCode int) error {
 		return nil
 	}
 	for _, item := range items {
-		fmt.Printf("%d\t%s\t%s\t%s\t%s\t%s\n", item.StatusCode, handshakeStatusText(item.StatusCode), item.DeviceCode, item.Node.Name, item.Node.Role, item.ExpiresAt.Format(time.RFC3339))
+		fmt.Printf("%d\t%s\t%s\t%s\t%s\t%s\t%s\n", item.StatusCode, handshakeStatusText(item.StatusCode), item.DeviceCode, item.Node.Name, item.Node.Role, item.ExpiresAt.Format(time.RFC3339), item.Reason)
 	}
 	return nil
 }
@@ -1414,7 +1711,7 @@ func listAuditEvents(path string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("coordinator returned %s", resp.Status)
+		return coordinatorResponseError(resp)
 	}
 	var items []auditEvent
 	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
@@ -1431,14 +1728,14 @@ func listAuditEvents(path string) error {
 }
 
 func approveDeviceCode(path, code string, replace bool) error {
-	return decideDeviceCode(path, code, "approve", replace)
+	return decideDeviceCode(path, code, "approve", replace, "")
 }
 
-func rejectDeviceCode(path, code string) error {
-	return decideDeviceCode(path, code, "reject", false)
+func rejectDeviceCode(path, code, reason string) error {
+	return decideDeviceCode(path, code, "reject", false, reason)
 }
 
-func decideDeviceCode(path, code, decision string, replace bool) error {
+func decideDeviceCode(path, code, decision string, replace bool, reason string) error {
 	if normalizeDeviceCode(code) == "" {
 		return errors.New("--device-code is required")
 	}
@@ -1446,7 +1743,7 @@ func decideDeviceCode(path, code, decision string, replace bool) error {
 	if err != nil {
 		return err
 	}
-	body, _ := json.Marshal(approveRequest{DeviceCode: code, Replace: replace})
+	body, _ := json.Marshal(approveRequest{DeviceCode: code, Replace: replace, Reason: reason})
 	req, _ := http.NewRequest(http.MethodPost, origin+"/v1/admin/"+decision, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+p.Server.AdminToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -1456,7 +1753,7 @@ func decideDeviceCode(path, code, decision string, replace bool) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("coordinator returned %s", resp.Status)
+		return coordinatorResponseError(resp)
 	}
 	fmt.Println("handshake " + map[string]string{"approve": "approved", "reject": "rejected"}[decision])
 	return nil
@@ -1480,7 +1777,7 @@ func revokeNodeID(path, nodeID string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("coordinator returned %s", resp.Status)
+		return coordinatorResponseError(resp)
 	}
 	fmt.Println("node revoked")
 	return nil
@@ -1556,7 +1853,7 @@ func printNodes(nodes []discoveredNode) error {
 		fmt.Println("no discovered nodes")
 		return nil
 	}
-	fmt.Println("NODE_ID\tNAME\tROLE\tSEGMENT\tRELAY\tUPSTREAM_RELAY\tENDPOINTS\tLAST_SEEN")
+	fmt.Println("NODE_ID\tNAME\tROLE\tSEGMENT\tRELAY\tUPSTREAM_RELAY\tLAST_SEEN")
 	for _, n := range nodes {
 		relay := "-"
 		if n.Relay != nil {
@@ -1566,9 +1863,13 @@ func printNodes(nodes []discoveredNode) error {
 		if upstream == "" {
 			upstream = "-"
 		}
-		fmt.Printf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n.ID, n.Name, n.Role, n.Segment, relay, upstream, strings.Join(n.Endpoints, ","), n.LastSeen.Format(time.RFC3339))
+		fmt.Printf("%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n.ID, n.Name, n.Role, n.Segment, relay, upstream, n.LastSeen.Format(time.RFC3339))
 		for _, service := range n.Services {
-			fmt.Printf("  service\t%s\t%s\n", service.Name, service.Endpoint)
+			addresses := make([]string, 0, len(service.DirectCandidates))
+			for _, candidate := range service.DirectCandidates {
+				addresses = append(addresses, candidate.Address)
+			}
+			fmt.Printf("  service\t%s\tdirect=%s\n", service.Name, strings.Join(addresses, ","))
 		}
 	}
 	return nil

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -108,6 +109,26 @@ func TestRelayPortsAndCoordinatorAreRequiredAtCreation(t *testing.T) {
 	}
 }
 
+func TestRelayCreationStoresAdmissionTokenHash(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.json")
+	options := options{
+		instance: "relay", role: "relay", network: "mesh", segment: "home", config: path,
+		transitListen: freeAddress(t), transitEndpoint: "relay.example:29443",
+		coordinator: "https://127.0.0.1:1", coordinatorPin: strings.Repeat("a", 64),
+		set: map[string]bool{},
+	}
+	// Enrollment is attempted after the profile is atomically saved. The remote
+	// example endpoint is intentionally unreachable; inspect the saved profile.
+	_ = install(options, path, false)
+	p, err := loadProfile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validRelayAdmissionTokenHash(p.Relay.AdmissionTokenHash) {
+		t.Fatalf("relay admission token hash=%q", p.Relay.AdmissionTokenHash)
+	}
+}
+
 func TestSubnodeRequiresExplicitUpstreamRelayAndCoordinator(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "subnode.json")
 	base := options{
@@ -120,6 +141,7 @@ func TestSubnodeRequiresExplicitUpstreamRelayAndCoordinator(t *testing.T) {
 	base.upstreamRelayNode = "relay-node-id"
 	base.upstreamRelayEndpoint = "relay.example:29443"
 	base.upstreamRelayPin = strings.Repeat("a", 64)
+	base.upstreamRelayToken = "relay-admission-token"
 	if err := install(base, path, false); err == nil || !strings.Contains(err.Error(), "must configure --coordinator") {
 		t.Fatalf("missing coordinator error=%v", err)
 	}
@@ -159,6 +181,37 @@ func TestAutomaticPullRequiresCoordinatorAndPersistsRoute(t *testing.T) {
 	}
 	if len(got.Mappings) != 1 || got.Mappings[0].TargetNode != "home-node" || got.Mappings[0].Service != "nas" {
 		t.Fatalf("automatic route not persisted: %#v", got.Mappings)
+	}
+}
+
+func TestPublishMappingDoesNotPersistDirectAddress(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "publisher.json")
+	if err := saveProfile(path, profile{
+		Version: profileVersion, Instance: "publisher", Role: "client",
+		VirtualNetwork: "mesh", Segment: "school", Node: nodeConfig{ID: "publisher"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	o := options{
+		name: "school-socks", kind: "publish", listen: freeAddress(t),
+		target: "127.0.0.1:31080",
+	}
+	if err := addMapping(o, path); err != nil {
+		t.Fatalf("publish without endpoint: %v", err)
+	}
+	got, err := loadProfile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Mappings) != 1 || got.Mappings[0].Listen == "" {
+		t.Fatalf("publish mapping was not persisted: %#v", got.Mappings)
+	}
+	body, err := json.Marshal(got.Mappings[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), `"endpoint"`) || strings.Contains(string(body), `"direct_candidates"`) {
+		t.Fatalf("profile retained runtime direct-address state: %s", body)
 	}
 }
 

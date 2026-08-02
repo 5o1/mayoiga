@@ -31,7 +31,10 @@ def gateway():
 
     Gateway remains a descriptive client role. Transit capability belongs to
     the `relay` role; no source-side gateway is required. A gateway can still
-    publish services and create automatic pulls like any client.
+    publish services and create automatic pulls like any client. Published
+    services never configure a public endpoint. The coordinator derives and
+    leases same-segment private-LAN candidates at runtime; all other access
+    uses the publisher-initiated reverse relay path.
     """
     from docs.architecture import architecture
     from docs.operations import operations
@@ -45,8 +48,10 @@ def relay():
     services and also accepts signed TLS 1.3 transit requests. Configure
     `--transit-listen`, `--transit-endpoint`, and `--relay-priority` while
     joining a coordinator. Cross-segment access to services published by the
-    relay itself also enters this transit listener, so those publish endpoints
-    may remain local; same-segment access remains direct. Normal transit
+    relay itself also enters this transit listener; publishers do not need a
+    fixed public endpoint. Same-segment access uses a coordinator-managed
+    leased candidate when available and otherwise the publisher-initiated
+    reverse path. Normal transit
     terminates at registered services in its own segment. When serving as a
     subnode's declared upstream it may
     continue through the normal target-side route. Multiple target-segment
@@ -63,7 +68,8 @@ def subnode():
 
     A subnode is a client without direct WAN access. It specifies exactly one
     same-segment relay using `--upstream-relay-node`,
-    `--upstream-relay-endpoint`, and `--upstream-relay-pin`. Enrollment,
+    `--upstream-relay-endpoint`, `--upstream-relay-pin`, and the secret
+    `--upstream-relay-token` printed when that relay was created. Enrollment,
     polling, discovery, and outgoing mappings use that relay; the coordinator
     TLS session remains end-to-end pinned inside the relay tunnel.
 
