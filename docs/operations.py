@@ -5,25 +5,47 @@ def operations():
     """# Operations
 
     Build and verify with `make build` and `make test`. `go.mod` defines the
-    module. The executable is implemented by `cmd/mayoiga/main.go`,
-    `cmd/mayoiga/node_manager.go`, `cmd/mayoiga/relay.go`,
-    `cmd/mayoiga/render.go`, `cmd/mayoiga/xraycore.go`, and
-    `cmd/mayoiga/hash.go`. Coordination and discovery are implemented in
-    `cmd/mayoiga/coordinator.go` and tested by
-    `cmd/mayoiga/coordinator_test.go`; platform signals are in
-    `cmd/mayoiga/platform.go` and `cmd/mayoiga/platform_windows.go`. Tests
-    live in `cmd/mayoiga/xraycore_test.go` and
-    `cmd/mayoiga/node_manager_test.go`, `cmd/mayoiga/relay_test.go`, and the
-    optional external `cmd/mayoiga/danted_integration_linux_test.go`.
-    Long-poll connection control is implemented in
-    `cmd/mayoiga/connections.go` and tested by
-    `cmd/mayoiga/connections_test.go`. The
-    multi-node supervisor is implemented in
-    `cmd/mayoiga/service_manager.go`, with Linux integration in
-    `cmd/mayoiga/service_linux.go`, portable fallbacks in
-    `cmd/mayoiga/service_other.go`, and coverage in
-    `cmd/mayoiga/service_manager_test.go`. The
-    release binary embeds the
+    module. The CLI entry and actions are in `cmd/mayoiga/main.go`, with
+    prompting in `cmd/mayoiga/interactive.go`, locale loading in
+    `cmd/mayoiga/locale.go`, persistent model and certificates in
+    `cmd/mayoiga/profile.go`, node configuration in
+    `cmd/mayoiga/node_config.go`, and foreground lifecycle in
+    `cmd/mayoiga/runtime.go`. `cmd/mayoiga/node_manager.go` manages the node
+    collection; `cmd/mayoiga/render.go`, `cmd/mayoiga/xraycore.go`, and
+    `cmd/mayoiga/hash.go` provide mapping rendering and embedded-core helpers.
+    Platform signals are in `cmd/mayoiga/platform.go` and
+    `cmd/mayoiga/platform_windows.go`.
+
+    Coordinator state is defined in `cmd/mayoiga/coordinator_types.go`; its
+    HTTP boundary, enrollment, directory updates, runtime, and node client
+    are respectively `cmd/mayoiga/coordinator_http.go`,
+    `cmd/mayoiga/coordinator_enrollment.go`,
+    `cmd/mayoiga/coordinator_nodes.go`,
+    `cmd/mayoiga/coordinator_runtime.go`, and
+    `cmd/mayoiga/coordinator_client.go`. Long-poll connection control is
+    divided into `cmd/mayoiga/connection_types.go`,
+    `cmd/mayoiga/connection_server.go`, `cmd/mayoiga/connection_inbox.go`,
+    `cmd/mayoiga/connection_workers.go`, and
+    `cmd/mayoiga/connection_client.go`. Relay protocol, pull routing, relay
+    handling, dialing, and shared types live in
+    `cmd/mayoiga/relay_protocol.go`, `cmd/mayoiga/relay_pull.go`,
+    `cmd/mayoiga/relay_server.go`, `cmd/mayoiga/relay_dial.go`, and
+    `cmd/mayoiga/relay_types.go`. Supervisor validation, process management,
+    and binary staging live in `cmd/mayoiga/service_profiles.go`,
+    `cmd/mayoiga/service_supervisor.go`, and
+    `cmd/mayoiga/service_stage.go`; platform integration remains in
+    `cmd/mayoiga/service_linux.go` and `cmd/mayoiga/service_other.go`.
+    Coordinator coverage is split between
+    `cmd/mayoiga/coordinator_enrollment_test.go`,
+    `cmd/mayoiga/coordinator_discovery_test.go`,
+    `cmd/mayoiga/coordinator_admin_test.go`, and
+    `cmd/mayoiga/coordinator_runtime_test.go`. Relay coverage is split between
+    `cmd/mayoiga/relay_end_to_end_test.go`,
+    `cmd/mayoiga/relay_reverse_test.go`, and
+    `cmd/mayoiga/relay_routing_test.go`. Other behavioral coverage is in
+    `cmd/mayoiga/connections_test.go`, `cmd/mayoiga/service_manager_test.go`,
+    `cmd/mayoiga/node_manager_test.go`, and
+    `cmd/mayoiga/xraycore_test.go`. The release binary embeds the
     separately maintained `cmd/mayoiga/locales/en.json` and
     `cmd/mayoiga/locales/zh_CN.json` resources.
 
