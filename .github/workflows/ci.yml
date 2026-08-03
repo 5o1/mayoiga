@@ -1,0 +1,39 @@
+name: Continuous integration
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test and static checks
+        run: |
+          set -euo pipefail
+          make test
+          go vet ./...
+
+      - name: Build Linux and Windows binaries
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -buildvcs=false \
+            -o /tmp/mayoiga-linux-amd64 ./cmd/mayoiga
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -buildvcs=false \
+            -o /tmp/mayoiga-windows-amd64.exe ./cmd/mayoiga

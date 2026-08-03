@@ -270,7 +270,7 @@ func TestSubnodeGatewayAuthorizationScansAllPeers(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !relay.isAuthorizedSubnodeGateway("offline") {
+	if !relay.isAuthorizedSubnodeRelay("offline") {
 		t.Fatal("authorized subnode after another peer was not found")
 	}
 }

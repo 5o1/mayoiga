@@ -30,10 +30,8 @@ func install(o options, path string, configure bool) error {
 	if p.Role == "" {
 		return errors.New("--role is required")
 	}
-	switch p.Role {
-	case "client", "gateway", "relay", "subnode", "coordinator":
-	default:
-		return errors.New("--role must be client, gateway, relay, subnode, or coordinator")
+	if !validNodeRole(p.Role) {
+		return errors.New("--role must be client, relay, subnode, or coordinator")
 	}
 	if !configure || o.set["segment"] {
 		p.Segment = o.segment

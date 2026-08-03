@@ -48,7 +48,10 @@ def operations():
     `internal/app/node_manager_test.go`, and
     `internal/app/xraycore_test.go`. The release binary embeds the
     separately maintained `internal/app/locales/en.json` and
-    `internal/app/locales/zh_CN.json` resources.
+    `internal/app/locales/zh_CN.json` resources. `.github/workflows/ci.yml`
+    runs tests, static checks, and Linux/Windows builds on every branch push
+    and pull request. `.github/workflows/release.yml` builds and publishes
+    release assets only for `v*` tags.
 
     Create and register the destination, then publish a named service:
 
@@ -63,7 +66,7 @@ def operations():
     --service nas`; no credentials are copied manually. A relay is configured
     at node creation and serves registered services in its own segment.
     A subnode additionally names one registered same-segment relay as its
-    fixed control- and data-plane gateway. Relay creation prints a
+    fixed control- and data-plane upstream. Relay creation prints a
     `SUBNODE_RELAY_TOKEN` once; keep it private and pass it to every allowed
     subnode with `--upstream-relay-token`.
     Rotate a leaked token with `configure-node --rotate-relay-token`, then

@@ -39,7 +39,6 @@ DOCS_PKG = REPO_ROOT / "docs"
 # check because nobody calls them -- agents enter the graph here.
 ENTRY_POINTS = [
     ("docs.roles", "client"),
-    ("docs.roles", "gateway"),
     ("docs.roles", "relay"),
     ("docs.roles", "subnode"),
     ("docs.roles", "coordinator"),

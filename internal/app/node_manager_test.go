@@ -288,7 +288,7 @@ func TestNodeCRUDWithIndependentProfiles(t *testing.T) {
 		}
 	}
 	add("first", first, "client", "one")
-	add("second", second, "gateway", "two")
+	add("second", second, "client", "two")
 
 	p1, err := loadProfile(first)
 	if err != nil {
@@ -325,5 +325,26 @@ func TestNodeCRUDWithIndependentProfiles(t *testing.T) {
 	}
 	if _, err := os.Stat(second); err != nil {
 		t.Fatalf("deleting first affected second: %v", err)
+	}
+}
+
+func TestInstallRejectsGatewayRole(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.json")
+	err := install(options{
+		instance: "gateway", role: "gateway", network: "family", segment: "home", config: path,
+		set: map[string]bool{},
+	}, path, false)
+	if err == nil || !strings.Contains(err.Error(), "--role must be client, relay, subnode, or coordinator") {
+		t.Fatalf("gateway role error=%v", err)
+	}
+}
+
+func TestLoadProfileRejectsGatewayRole(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.json")
+	if err := os.WriteFile(path, []byte(`{"version":8,"role":"gateway"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadProfile(path); err == nil || !strings.Contains(err.Error(), `unsupported node role "gateway"`) {
+		t.Fatalf("gateway profile error=%v", err)
 	}
 }

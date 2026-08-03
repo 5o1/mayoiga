@@ -145,8 +145,8 @@ func (r *relayServer) handle(connection net.Conn) {
 			target, err = r.dialReverseService(targetNode, service)
 		}
 	} else {
-		if !r.isAuthorizedSubnodeGateway(handshake.SourceNode) {
-			writeRelayError(connection, "cross_segment_denied", "this source is not authorized for cross-segment gateway routing")
+		if !r.isAuthorizedSubnodeRelay(handshake.SourceNode) {
+			writeRelayError(connection, "cross_segment_denied", "this source is not authorized for cross-segment relay routing")
 			return
 		}
 		if targetNode.Role == "relay" {
@@ -220,7 +220,7 @@ func (r *relayServer) dialReverseService(target discoveredNode, service publishe
 	}
 }
 
-func (r *relayServer) isAuthorizedSubnodeGateway(sourceNode string) bool {
+func (r *relayServer) isAuthorizedSubnodeRelay(sourceNode string) bool {
 	nodes, err := loadDiscovered(r.path)
 	if err != nil {
 		return false

@@ -6,23 +6,31 @@ ports end to end: it does not publish applications directly to the public
 Internet and does not route all device traffic. This reduces exposure and
 avoids conflicts with other networking software.
 
-## Role Configuration Examples
+## Deployment Topologies
 
 Replace the example hosts, pins, node IDs, and ports with your own values.
 Every node joining a coordinator displays a one-time device code that must be
 approved on the coordinator.
 
-### Coordinator
+### Minimum: coordinator and clients
+
+The minimum control plane is one coordinator and one or more clients. The
+coordinator only authenticates nodes and distributes discovery information; it
+is not in the application data path. A usable end-to-end mapping needs a
+second client (or relay) to publish the target service.
+
+#### Coordinator
 
 ```bash
 mayoiga --instance control --role coordinator --network family \
   --listen 0.0.0.0:18443 --admin-listen 127.0.0.1:19443 \
   --action add-node
 mayoiga --instance control --action start
+# Enter the device code printed when a client is added.
 mayoiga --instance control --action approve --device-code ABCD-EFGH
 ```
 
-### Client
+#### Client
 
 ```bash
 mayoiga --instance school --role client --network family --segment campus \
@@ -33,17 +41,12 @@ mayoiga --instance school --action add --kind pull --name home-nas \
 mayoiga --instance school --action start
 ```
 
-### Gateway
+### NAT-restricted clients: add a relay
 
-A gateway is a descriptive client role and can publish or pull services:
-
-```bash
-mayoiga --instance lan-gateway --role gateway --network family --segment home \
-  --coordinator https://home.example:18443 --coordinator-pin <PIN> \
-  --action add-node
-```
-
-### Relay
+When two clients cannot make a direct connection because they are both behind
+restrictive NATs, add a reachable relay. Each endpoint uses the relay's
+encrypted connection path, so either side can publish a service and the other
+can pull it. Direct private-LAN access remains preferred when it is available.
 
 ```bash
 mayoiga --instance home-relay --role relay --network family --segment home \
@@ -51,13 +54,24 @@ mayoiga --instance home-relay --role relay --network family --segment home \
   --transit-endpoint home.example:29443 --relay-priority 10 \
   --coordinator https://home.example:18443 --coordinator-pin <PIN> \
   --action add-node
-mayoiga --instance home-relay --action add --kind publish --name nas \
-  --listen 0.0.0.0:28443 \
-  --target 192.168.1.20:5000
 mayoiga --instance home-relay --action start
 ```
 
-### Subnode
+The relay is also a client: it may publish services itself, for example a NAS
+on its reachable LAN:
+
+```bash
+mayoiga --instance home-relay --action add --kind publish --name nas \
+  --listen 0.0.0.0:28443 \
+  --target 192.168.1.20:5000
+```
+
+### LAN-only machines: use a subnode
+
+A client on a LAN-only machine with no wide-area network access is a
+**subnode**. It needs a directly reachable relay in the same segment. That
+relay forwards its coordinator registration, discovery, and service traffic;
+the subnode does not need a public endpoint or its own Internet route.
 
 ```bash
 mayoiga --instance offline-node --role subnode --network family --segment home \

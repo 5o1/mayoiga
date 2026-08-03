@@ -63,13 +63,13 @@ func interactive(o *options, m messages) error {
 			o.connectionLeaseSeconds, o.connectionMaxPending = p.Server.ConnectionOfferLeaseSeconds, p.Server.ConnectionMaxPending
 		}
 		fmt.Println(m["prompt.role"])
-		fmt.Printf("1) %s  2) %s  3) %s  4) %s  5) %s", m["role.client"], m["role.gateway"], m["role.relay"], m["role.subnode"], m["role.coordinator"])
+		fmt.Printf("1) %s  2) %s  3) %s  4) %s", m["role.client"], m["role.relay"], m["role.subnode"], m["role.coordinator"])
 		if configure {
 			fmt.Printf(" [%s]", o.role)
 		}
 		fmt.Print("\n> ")
 		in.Scan()
-		roles := map[string]string{"1": "client", "2": "gateway", "3": "relay", "4": "subnode", "5": "coordinator"}
+		roles := map[string]string{"1": "client", "2": "relay", "3": "subnode", "4": "coordinator"}
 		if value := roles[strings.TrimSpace(in.Text())]; value != "" {
 			o.role, o.set["role"] = value, true
 		}

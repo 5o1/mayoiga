@@ -101,9 +101,7 @@ func validateManagedProfile(p profile) error {
 	if err := validateInstance(p.Instance); err != nil {
 		return err
 	}
-	switch p.Role {
-	case "client", "gateway", "relay", "subnode", "coordinator":
-	default:
+	if !validNodeRole(p.Role) {
 		return fmt.Errorf("invalid node role %q", p.Role)
 	}
 	if strings.TrimSpace(p.VirtualNetwork) == "" || strings.TrimSpace(p.Segment) == "" {

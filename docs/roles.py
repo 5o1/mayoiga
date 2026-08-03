@@ -26,21 +26,6 @@ def client():
     architecture(); operations(); security()
 
 
-def gateway():
-    """# Gateway
-
-    Gateway remains a descriptive client role. Transit capability belongs to
-    the `relay` role; no source-side gateway is required. A gateway can still
-    publish services and create automatic pulls like any client. Published
-    services never configure a public endpoint. The coordinator derives and
-    leases same-segment private-LAN candidates at runtime; all other access
-    uses the publisher-initiated reverse relay path.
-    """
-    from docs.architecture import architecture
-    from docs.operations import operations
-    architecture(); operations()
-
-
 def relay():
     """# Relay
 

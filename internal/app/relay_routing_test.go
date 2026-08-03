@@ -355,22 +355,22 @@ func TestRouteRulesPreferDirectSameSegmentAndTransitForCrossSegmentRelay(t *test
 		t.Fatalf("cross-segment relay target did not select its own transit: %+v", candidates)
 	}
 
-	target.Role, target.UpstreamRelay = "subnode", "home-gateway"
+	target.Role, target.UpstreamRelay = "subnode", "home-relay"
 	target.Relay = nil
 	target.Segment = "home"
-	gateway := discoveredNode{
-		ID: "home-gateway", Role: "relay", Segment: "home",
+	upstreamRelay := discoveredNode{
+		ID: "home-relay", Role: "relay", Segment: "home",
 		Relay: &relayAdvertisement{Endpoint: "relay.example:29443", Priority: 10},
 	}
 	otherRelay = discoveredNode{
 		ID: "other-relay", Role: "relay", Segment: "home",
 		Relay: &relayAdvertisement{Endpoint: "other.example:29443", Priority: 1},
 	}
-	if err := saveDiscovered(path, []discoveredNode{target, otherRelay, gateway}); err != nil {
+	if err := saveDiscovered(path, []discoveredNode{target, otherRelay, upstreamRelay}); err != nil {
 		t.Fatal(err)
 	}
 	_, _, relays, err = resolveRoute(local, path, mapping{TargetNode: "target", Service: "svc"})
-	if err != nil || len(relays) != 1 || relays[0].ID != "home-gateway" {
+	if err != nil || len(relays) != 1 || relays[0].ID != "home-relay" {
 		t.Fatalf("subnode did not force its upstream relay: relays=%+v err=%v", relays, err)
 	}
 }

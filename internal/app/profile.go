@@ -104,7 +104,19 @@ func loadProfile(path string) (profile, error) {
 	if p.Version != profileVersion {
 		return p, fmt.Errorf("unsupported profile version %d; delete and add the node again", p.Version)
 	}
+	if !validNodeRole(p.Role) {
+		return p, fmt.Errorf("unsupported node role %q; delete and add the node again", p.Role)
+	}
 	return p, nil
+}
+
+func validNodeRole(role string) bool {
+	switch role {
+	case "client", "relay", "subnode", "coordinator":
+		return true
+	default:
+		return false
+	}
 }
 
 func saveProfile(path string, p profile) error {

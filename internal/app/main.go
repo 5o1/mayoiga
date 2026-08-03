@@ -31,7 +31,7 @@ type options struct {
 func Run() {
 	var o options
 	flag.StringVar(&o.lang, "lang", "", "locale: en or zh_CN")
-	flag.StringVar(&o.role, "role", "", "client, gateway, relay, subnode, or coordinator")
+	flag.StringVar(&o.role, "role", "", "client, relay, subnode, or coordinator")
 	flag.StringVar(&o.action, "action", "", "node, mapping, coordinator, and connection control action")
 	flag.StringVar(&o.instance, "instance", "", "local node instance name")
 	flag.StringVar(&o.segment, "segment", "default", "logical network segment")

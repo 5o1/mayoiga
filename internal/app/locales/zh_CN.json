@@ -35,7 +35,6 @@
   "prompt.request_id": "连接请求 ID：",
   "prompt.reason": "原因（可选）：",
   "role.client": "客户端",
-  "role.gateway": "网关",
   "role.relay": "可选中继",
   "role.subnode": "亚节点",
   "role.coordinator": "协调端",
