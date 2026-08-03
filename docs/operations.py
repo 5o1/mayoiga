@@ -5,49 +5,50 @@ def operations():
     """# Operations
 
     Build and verify with `make build` and `make test`. `go.mod` defines the
-    module. The CLI entry and actions are in `cmd/mayoiga/main.go`, with
-    prompting in `cmd/mayoiga/interactive.go`, locale loading in
-    `cmd/mayoiga/locale.go`, persistent model and certificates in
-    `cmd/mayoiga/profile.go`, node configuration in
-    `cmd/mayoiga/node_config.go`, and foreground lifecycle in
-    `cmd/mayoiga/runtime.go`. `cmd/mayoiga/node_manager.go` manages the node
-    collection; `cmd/mayoiga/render.go`, `cmd/mayoiga/xraycore.go`, and
-    `cmd/mayoiga/hash.go` provide mapping rendering and embedded-core helpers.
-    Platform signals are in `cmd/mayoiga/platform.go` and
-    `cmd/mayoiga/platform_windows.go`.
+    module. `cmd/mayoiga/main.go` is the thin executable entry point; its
+    private application package begins at `internal/app/main.go`, with
+    prompting in `internal/app/interactive.go`, locale loading in
+    `internal/app/locale.go`, persistent model and certificates in
+    `internal/app/profile.go`, node configuration in
+    `internal/app/node_config.go`, and foreground lifecycle in
+    `internal/app/runtime.go`. `internal/app/node_manager.go` manages the node
+    collection; `internal/app/render.go`, `internal/app/xraycore.go`, and
+    `internal/app/hash.go` provide mapping rendering and embedded-core helpers.
+    Platform signals are in `internal/app/platform.go` and
+    `internal/app/platform_windows.go`.
 
-    Coordinator state is defined in `cmd/mayoiga/coordinator_types.go`; its
+    Coordinator state is defined in `internal/app/coordinator_types.go`; its
     HTTP boundary, enrollment, directory updates, runtime, and node client
-    are respectively `cmd/mayoiga/coordinator_http.go`,
-    `cmd/mayoiga/coordinator_enrollment.go`,
-    `cmd/mayoiga/coordinator_nodes.go`,
-    `cmd/mayoiga/coordinator_runtime.go`, and
-    `cmd/mayoiga/coordinator_client.go`. Long-poll connection control is
-    divided into `cmd/mayoiga/connection_types.go`,
-    `cmd/mayoiga/connection_server.go`, `cmd/mayoiga/connection_inbox.go`,
-    `cmd/mayoiga/connection_workers.go`, and
-    `cmd/mayoiga/connection_client.go`. Relay protocol, pull routing, relay
+    are respectively `internal/app/coordinator_http.go`,
+    `internal/app/coordinator_enrollment.go`,
+    `internal/app/coordinator_nodes.go`,
+    `internal/app/coordinator_runtime.go`, and
+    `internal/app/coordinator_client.go`. Long-poll connection control is
+    divided into `internal/app/connection_types.go`,
+    `internal/app/connection_server.go`, `internal/app/connection_inbox.go`,
+    `internal/app/connection_workers.go`, and
+    `internal/app/connection_client.go`. Relay protocol, pull routing, relay
     handling, dialing, and shared types live in
-    `cmd/mayoiga/relay_protocol.go`, `cmd/mayoiga/relay_pull.go`,
-    `cmd/mayoiga/relay_server.go`, `cmd/mayoiga/relay_dial.go`, and
-    `cmd/mayoiga/relay_types.go`. Supervisor validation, process management,
-    and binary staging live in `cmd/mayoiga/service_profiles.go`,
-    `cmd/mayoiga/service_supervisor.go`, and
-    `cmd/mayoiga/service_stage.go`; platform integration remains in
-    `cmd/mayoiga/service_linux.go` and `cmd/mayoiga/service_other.go`.
+    `internal/app/relay_protocol.go`, `internal/app/relay_pull.go`,
+    `internal/app/relay_server.go`, `internal/app/relay_dial.go`, and
+    `internal/app/relay_types.go`. Supervisor validation, process management,
+    and binary staging live in `internal/app/service_profiles.go`,
+    `internal/app/service_supervisor.go`, and
+    `internal/app/service_stage.go`; platform integration remains in
+    `internal/app/service_linux.go` and `internal/app/service_other.go`.
     Coordinator coverage is split between
-    `cmd/mayoiga/coordinator_enrollment_test.go`,
-    `cmd/mayoiga/coordinator_discovery_test.go`,
-    `cmd/mayoiga/coordinator_admin_test.go`, and
-    `cmd/mayoiga/coordinator_runtime_test.go`. Relay coverage is split between
-    `cmd/mayoiga/relay_end_to_end_test.go`,
-    `cmd/mayoiga/relay_reverse_test.go`, and
-    `cmd/mayoiga/relay_routing_test.go`. Other behavioral coverage is in
-    `cmd/mayoiga/connections_test.go`, `cmd/mayoiga/service_manager_test.go`,
-    `cmd/mayoiga/node_manager_test.go`, and
-    `cmd/mayoiga/xraycore_test.go`. The release binary embeds the
-    separately maintained `cmd/mayoiga/locales/en.json` and
-    `cmd/mayoiga/locales/zh_CN.json` resources.
+    `internal/app/coordinator_enrollment_test.go`,
+    `internal/app/coordinator_discovery_test.go`,
+    `internal/app/coordinator_admin_test.go`, and
+    `internal/app/coordinator_runtime_test.go`. Relay coverage is split between
+    `internal/app/relay_end_to_end_test.go`,
+    `internal/app/relay_reverse_test.go`, and
+    `internal/app/relay_routing_test.go`. Other behavioral coverage is in
+    `internal/app/connections_test.go`, `internal/app/service_manager_test.go`,
+    `internal/app/node_manager_test.go`, and
+    `internal/app/xraycore_test.go`. The release binary embeds the
+    separately maintained `internal/app/locales/en.json` and
+    `internal/app/locales/zh_CN.json` resources.
 
     Create and register the destination, then publish a named service:
 

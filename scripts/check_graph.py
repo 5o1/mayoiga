@@ -49,6 +49,8 @@ ENTRY_POINTS = [
 ASSET_GLOBS = [
     "cmd/**/*.go",
     "cmd/**/locales/*.json",
+    "internal/**/*.go",
+    "internal/**/locales/*.json",
     "go.mod",
     ".github/workflows/*.yml",
 ]

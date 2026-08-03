@@ -33,12 +33,12 @@ jobs:
 
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
             go build -trimpath -buildvcs=false \
-            -ldflags="-s -w -X main.version=${VERSION}" \
+            -ldflags="-s -w -X mayoiga/internal/app.version=${VERSION}" \
             -o dist/ubuntu-amd64/mayoiga ./cmd/mayoiga
 
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
             go build -trimpath -buildvcs=false \
-            -ldflags="-s -w -X main.version=${VERSION}" \
+            -ldflags="-s -w -X mayoiga/internal/app.version=${VERSION}" \
             -o dist/windows-amd64/mayoiga.exe ./cmd/mayoiga
 
           tar -C dist/ubuntu-amd64 -czf \
